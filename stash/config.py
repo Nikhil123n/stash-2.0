@@ -44,10 +44,37 @@ class StashConfig(BaseModel):
         return self.STASH_OWNER_ID
 
 
+def _setup_gcp_credentials() -> str:
+    """Handle GCP credentials: file path or base64-encoded JSON in env var."""
+    import base64
+    import tempfile
+
+    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+
+    # If it points to an existing file, use it directly
+    if creds_path and os.path.isfile(creds_path):
+        return creds_path
+
+    # If GCP_CREDENTIALS_JSON is set (base64-encoded), decode to a temp file
+    b64_json = os.environ.get("GCP_CREDENTIALS_JSON", "")
+    if b64_json:
+        creds_dir = "/tmp/stash"
+        os.makedirs(creds_dir, exist_ok=True)
+        creds_file = os.path.join(creds_dir, "gcp-key.json")
+        with open(creds_file, "w") as f:
+            f.write(base64.b64decode(b64_json).decode())
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_file
+        return creds_file
+
+    return creds_path
+
+
 def load_config() -> StashConfig:
     from dotenv import load_dotenv
 
     load_dotenv(override=True)
+
+    _setup_gcp_credentials()
 
     required_keys = [
         "DISCORD_TOKEN",
