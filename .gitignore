@@ -1,0 +1,12 @@
+.env
+gcp-key.json
+*.json
+sandbox_data.json
+curl_paste.txt
+__pycache__/
+*.pyc
+.pytest_cache/
+/tmp/stash/
+*.egg-info/
+dist/
+build/
