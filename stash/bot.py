@@ -42,6 +42,7 @@ class StashBot(discord.Client):
 
     async def setup_hook(self) -> None:
         self._wipe_tmp()
+        self._restore_gcp_credentials()
 
         self._gateway = create_gateway(self._config)
         if hasattr(self._gateway, "initialize"):
@@ -65,6 +66,11 @@ class StashBot(discord.Client):
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
         os.makedirs(tmp_dir, exist_ok=True)
+
+    def _restore_gcp_credentials(self) -> None:
+        """Re-write GCP credentials file if using base64 env var (wiped by _wipe_tmp)."""
+        from stash.config import _setup_gcp_credentials
+        _setup_gcp_credentials()
 
     async def on_ready(self) -> None:
         logger.info("Stash bot online as %s (env=%s, pid=%d)", self.user, self._config.ENV, os.getpid())
