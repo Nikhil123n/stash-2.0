@@ -52,8 +52,8 @@ class MyMindGateway:
         except PermissionError as e:
             raise AuthError(str(e)) from e
 
-    async def _resolve_space_id(self, space_name: str) -> str:
-        """Find space by name or create it. Returns space ID."""
+    async def _resolve_space_id(self, space_name: str) -> str | None:
+        """Find space by name or create it. Returns space ID or None if failed."""
         if self._spaces_cache is None:
             self._spaces_cache = await self.get_spaces()
 
@@ -62,6 +62,9 @@ class MyMindGateway:
                 return s["id"]
 
         new_space = await self.create_space(space_name)
+        if not new_space.get("id"):
+            logger.warning("Failed to create space '%s' — no ID returned", space_name)
+            return None
         self._spaces_cache.append(new_space)
         return new_space["id"]
 
@@ -78,10 +81,11 @@ class MyMindGateway:
 
         if space:
             space_id = await self._resolve_space_id(space)
-            await self._run_sync(
-                self._client._request, "PUT", f"/spaces/{space_id}/objects/{card_id}",
-                headers=self._client._headers_json(),
-            )
+            if space_id:
+                await self._run_sync(
+                    self._client._request, "PUT", f"/spaces/{space_id}/objects/{card_id}",
+                    headers=self._client._headers_json(),
+                )
 
         return SavedCard(
             mymind_id=card_id,
@@ -105,10 +109,11 @@ class MyMindGateway:
 
         if space:
             space_id = await self._resolve_space_id(space)
-            await self._run_sync(
-                self._client._request, "PUT", f"/spaces/{space_id}/objects/{card_id}",
-                headers=self._client._headers_json(),
-            )
+            if space_id:
+                await self._run_sync(
+                    self._client._request, "PUT", f"/spaces/{space_id}/objects/{card_id}",
+                    headers=self._client._headers_json(),
+                )
 
         return SavedCard(
             mymind_id=card_id,
@@ -148,10 +153,11 @@ class MyMindGateway:
 
         if space:
             space_id = await self._resolve_space_id(space)
-            await self._run_sync(
-                self._client._request, "PUT", f"/spaces/{space_id}/objects/{card_id}",
-                headers=self._client._headers_json(),
-            )
+            if space_id:
+                await self._run_sync(
+                    self._client._request, "PUT", f"/spaces/{space_id}/objects/{card_id}",
+                    headers=self._client._headers_json(),
+                )
 
         return SavedCard(
             mymind_id=card_id,

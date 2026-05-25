@@ -26,6 +26,8 @@ logger = logging.getLogger("stash")
 
 CONFIDENCE_THRESHOLD = 0.75
 CONFIRMATION_TIMEOUT = 300  # 5 minutes
+GATEWAY_MODE = "cookie-local"  # "jwt-railway" on main branch, "cookie-local" on stable/cookie-local
+VERSION = "2.0.0"
 
 
 class StashBot(discord.Client):
@@ -41,9 +43,18 @@ class StashBot(discord.Client):
         self._processed: set[int] = set()  # message IDs already handled (kept permanently)
 
     async def setup_hook(self) -> None:
+        logger.info("=" * 50)
+        logger.info("Stash v%s starting up", VERSION)
+        logger.info("Gateway: %s", GATEWAY_MODE)
+        logger.info("Environment: %s", self._config.ENV)
+        logger.info("=" * 50)
+
+        logger.info("[1/4] Preparing temp directory...")
         self._wipe_tmp()
         self._restore_gcp_credentials()
+        logger.info("  OK")
 
+        logger.info("[2/4] Connecting to mymind (%s)...", GATEWAY_MODE)
         self._gateway = create_gateway(self._config)
         if hasattr(self._gateway, "initialize"):
             await self._gateway.initialize()
@@ -52,14 +63,17 @@ class StashBot(discord.Client):
             from stash.gateway.mymind import AuthError
             try:
                 await self._gateway.test_connection()
-                logger.info("mymind connection verified")
+                logger.info("  mymind: connected")
             except AuthError as e:
-                logger.critical("mymind auth failed at startup: %s", e)
+                logger.critical("  mymind: FAILED — %s", e)
                 raise SystemExit(1)
 
+        logger.info("[3/4] Loading taxonomy...")
         self._taxonomy = TaxonomyCache(self._gateway)
         await self._taxonomy.initialize()
-        logger.info("Taxonomy loaded: %d spaces, %d tags", len(self._taxonomy.spaces), len(self._taxonomy.tags))
+        logger.info("  %d spaces, %d tags loaded", len(self._taxonomy.spaces), len(self._taxonomy.tags))
+
+        logger.info("[4/4] Services ready")
 
     def _wipe_tmp(self) -> None:
         tmp_dir = self._config.TMP_DIR
@@ -73,7 +87,19 @@ class StashBot(discord.Client):
         _setup_gcp_credentials()
 
     async def on_ready(self) -> None:
-        logger.info("Stash bot online as %s (env=%s, pid=%d)", self.user, self._config.ENV, os.getpid())
+        logger.info("Bot online as %s (pid=%d)", self.user, os.getpid())
+
+        owner = await self.fetch_user(self._config.OWNER_ID)
+        if owner:
+            try:
+                dm = await owner.create_dm()
+                await dm.send(
+                    f"**Stash v{VERSION} online**\n"
+                    f"Gateway: `{GATEWAY_MODE}`\n"
+                    f"Spaces: {len(self._taxonomy.spaces)} | Tags: {len(self._taxonomy.tags)}"
+                )
+            except discord.Forbidden:
+                logger.warning("Cannot DM owner — DMs disabled")
 
     async def on_message(self, message: discord.Message) -> None:
         if message.author.id != self._config.OWNER_ID:
