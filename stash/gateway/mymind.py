@@ -47,12 +47,10 @@ def _load_cookies_from_keyring() -> dict | None:
 
 
 def _create_client_with_cookies(cookies: dict):
-    """Create a MyMind client instance and inject cookies directly."""
-    from mymind_api.client import MyMind, _store_tokens
+    """Create a MyMind client instance and inject cookies directly, bypassing keyring."""
+    from mymind_api.client import MyMind
 
-    _store_tokens(cookies["jwt"], cookies["cid"], cookies["authenticity_token"])
-
-    client = MyMind()
+    client = object.__new__(MyMind)
     client._jwt = cookies["jwt"]
     client._cid = cookies["cid"]
     client._authenticity_token = cookies["authenticity_token"]

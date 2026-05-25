@@ -25,10 +25,11 @@ class TestMyMindGateway:
     @pytest.mark.asyncio
     async def test_test_connection_no_tokens_raises_auth_error(self):
         gw = MyMindGateway()
-        with patch("mymind_api.client._load_tokens", return_value=None):
-            with pytest.raises(AuthError):
-                gw._client = None
-                await gw.test_connection()
+        gw._client = None
+        with patch("stash.gateway.mymind._load_cookies_from_env", return_value=None):
+            with patch("stash.gateway.mymind._load_cookies_from_keyring", return_value=None):
+                with pytest.raises(AuthError):
+                    await gw.test_connection()
 
     @pytest.mark.asyncio
     async def test_get_spaces(self):
