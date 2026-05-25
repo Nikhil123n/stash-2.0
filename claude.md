@@ -74,6 +74,22 @@ All 14 steps complete. 44 tests passing.
 
 
 
+\## Branch Strategy
+
+| Branch | Purpose |
+|--------|---------|
+| main | Production — merge from approach/cookie via PR only |
+| approach/cookie | Active development — all work happens here |
+| approach/jwt | Archived JWT implementation — do not delete, do not modify |
+
+\### Workflow
+- Work on approach/cookie
+- When ready for prod: PR approach/cookie -> main
+- Never commit directly to main
+- approach/jwt is read-only archive
+
+
+
 \## Known gotchas
 
 - YouTube downloads blocked by bot detection on local Windows (works in Docker/cloud with clean IP)
