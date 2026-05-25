@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from stash.categorizer import _build_user_prompt, _parse_result, categorize
+from stash.categorizer import _build_user_prompt, _is_claude_content, _parse_result, categorize
 from stash.gateway.sandbox import SandboxGateway
 from stash.models import CategoryResult, ContentPacket, ContentType
 from stash.taxonomy import TaxonomyCache
@@ -32,11 +32,14 @@ class TestBuildUserPrompt:
             user_note="great tutorial",
         )
         prompt = _build_user_prompt(pkt, taxonomy)
-        assert "SPACES (categories): Tech, Career" in prompt
-        assert "TAGS: python, resume" in prompt
+        assert "Tech" in prompt
+        assert "Career" in prompt
+        assert "python" in prompt
+        assert "resume" in prompt
         assert "Transcript: A talk about async Python" in prompt
         assert "User note: great tutorial" in prompt
         assert "youtube_url" in prompt
+        assert "ALWAYS prefer an existing space" in prompt
 
     @pytest.mark.asyncio
     async def test_image_prompt(self, taxonomy):
@@ -139,3 +142,52 @@ class TestCategorize:
             assert result.title == "Fallback"
             assert PRIMARY_MODEL in call_count
             assert FALLBACK_MODEL in call_count
+
+
+class TestClaudeDetection:
+    def test_detects_claude_keyword(self):
+        pkt = ContentPacket(
+            content_type=ContentType.TEXT,
+            raw_input="Check out this Claude Code tutorial",
+        )
+        assert _is_claude_content(pkt) is True
+
+    def test_detects_anthropic(self):
+        pkt = ContentPacket(
+            content_type=ContentType.UNKNOWN_URL,
+            raw_input="https://anthropic.com/news",
+            user_note="Anthropic released new model",
+        )
+        assert _is_claude_content(pkt) is True
+
+    def test_detects_mcp(self):
+        pkt = ContentPacket(
+            content_type=ContentType.YOUTUBE_URL,
+            raw_input="https://youtube.com/watch?v=x",
+            transcript="In this video we build an MCP server for Claude",
+        )
+        assert _is_claude_content(pkt) is True
+
+    def test_no_match_for_unrelated(self):
+        pkt = ContentPacket(
+            content_type=ContentType.TEXT,
+            raw_input="How to make pasta carbonara",
+        )
+        assert _is_claude_content(pkt) is False
+
+    @pytest.mark.asyncio
+    async def test_categorize_claude_content(self, taxonomy):
+        pkt = ContentPacket(
+            content_type=ContentType.TEXT,
+            raw_input="Claude Code is amazing for coding",
+            user_note="Best AI coding tool",
+        )
+
+        mock_response = '{"title": "Claude Code Review", "summary": "A review of Claude Code for development."}'
+
+        with patch("stash.categorizer._call_gemini", new=AsyncMock(return_value=mock_response)):
+            result = await categorize(pkt, taxonomy)
+            assert result.category == "Claude"
+            assert result.confidence == 1.0
+            assert "claude" in result.tags
+            assert result.is_new_category is True

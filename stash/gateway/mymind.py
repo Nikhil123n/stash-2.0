@@ -117,12 +117,24 @@ class MyMindGateway:
             raise AuthError(str(e)) from e
 
     async def _resolve_space_id(self, space_name: str) -> str | None:
-        """Find space by name or create it. Returns space ID or None if failed."""
+        """Find space by name (fuzzy) or create it. Returns space ID or None if failed."""
+        from difflib import SequenceMatcher
+
         if self._spaces_cache is None:
             self._spaces_cache = await self.get_spaces()
 
+        proposed_norm = space_name.lower().strip()
+
+        # Exact match first
         for s in self._spaces_cache:
-            if s["name"].lower() == space_name.lower():
+            if s["name"].lower().strip() == proposed_norm:
+                return s["id"]
+
+        # Fuzzy match (>85% similarity)
+        for s in self._spaces_cache:
+            ratio = SequenceMatcher(None, proposed_norm, s["name"].lower().strip()).ratio()
+            if ratio > 0.85:
+                logger.info("Fuzzy matched '%s' -> '%s'", space_name, s["name"])
                 return s["id"]
 
         new_space = await self.create_space(space_name)

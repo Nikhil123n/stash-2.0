@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 
 from stash.gateway.interface import MindGateway
+
+logger = logging.getLogger(__name__)
 
 
 class TaxonomyCache:
@@ -21,6 +24,19 @@ class TaxonomyCache:
         self.spaces = await self._gateway.get_spaces()
         self.tags = await self._gateway.get_tags()
         self.last_refreshed = datetime.now(timezone.utc)
+        self._check_duplicate_spaces()
+
+    def _check_duplicate_spaces(self) -> None:
+        seen: dict[str, str] = {}
+        for s in self.spaces:
+            norm = s["name"].lower().strip()
+            if norm in seen:
+                logger.warning(
+                    "Duplicate spaces detected: '%s' and '%s'",
+                    seen[norm], s["name"],
+                )
+            else:
+                seen[norm] = s["name"]
 
     async def refresh_if_stale(self) -> None:
         if self.last_refreshed is None:

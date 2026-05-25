@@ -21,8 +21,10 @@ SYSTEM_PROMPT = (
 )
 
 USER_PROMPT_TEMPLATE = """\
-Here is the user's existing taxonomy in mymind:
-{taxonomy}
+Here are the EXACT existing spaces in the user's mymind:
+{space_names}
+
+TAGS: {tag_names}
 
 Content to categorize:
 Type: {content_type}
@@ -32,18 +34,54 @@ Type: {content_type}
 
 Instructions:
 1. Infer the topic from the FULL content provided (transcript, image, or text).
-2. Choose the best matching SPACE from the existing list. If none fits well, propose a new space name.
-3. Select 2–4 relevant tags from the existing list. You may add 1 new tag if clearly needed.
-4. Write a 1–2 sentence summary of what this content is actually about.
-5. Rate your confidence 0.0–1.0. Be honest. If the content was unclear or extraction failed, score lower.
+2. Choose a SPACE using these rules (follow strictly in order):
+   a. ALWAYS prefer an existing space over creating a new one
+   b. If the content fits an existing space even loosely, use it
+   c. Only propose a NEW space name if the content is completely unrelated to ALL existing spaces
+   d. Prefer the more specific space over generic: "Leg Day" beats "Health" for workout content
+   e. Return the EXACT space name as it appears in the list above — do not rephrase, abbreviate, or rename
+   f. "Technology" not "Tech", "Career Development" not "Career"
+3. is_new_category must be true ONLY if you propose a name not in the list above. If you matched an existing space, is_new_category MUST be false.
+4. Select 2-4 relevant tags from the existing list. You may add 1 new tag if clearly needed.
+5. Write a 1-2 sentence summary of what this content is actually about.
+6. Rate your confidence 0.0-1.0. Be honest. If the content was unclear or extraction failed, score lower.
 
 Respond ONLY with valid JSON. No markdown fences, no preamble.
 {{"title": "...", "category": "...", "tags": ["...", "..."], "summary": "...", "is_new_category": true/false, "confidence": 0.0, "reasoning": "..."}}\
 """
 
+TITLE_SUMMARY_PROMPT = """\
+Generate a title and 1-sentence summary for this content.
+Type: {content_type}
+{transcript_block}\
+{user_note_block}\
+
+Respond ONLY with valid JSON:
+{{"title": "...", "summary": "..."}}\
+"""
+
+CLAUDE_KEYWORDS = [
+    "claude", "anthropic", "claude.ai", "claude code",
+    "mcp server", "model context protocol", "claude sonnet",
+    "claude opus", "claude haiku", "artifacts",
+]
+
+
+def _is_claude_content(packet: ContentPacket) -> bool:
+    text = " ".join(filter(None, [
+        packet.transcript,
+        packet.page_text,
+        packet.user_note,
+        packet.raw_input,
+    ])).lower()
+    return any(keyword in text for keyword in CLAUDE_KEYWORDS)
+
 
 async def categorize(packet: ContentPacket, taxonomy: TaxonomyCache) -> CategoryResult:
     await taxonomy.refresh_if_stale()
+
+    if _is_claude_content(packet):
+        return await _categorize_claude(packet, taxonomy)
 
     user_prompt = _build_user_prompt(packet, taxonomy)
     image_data = None
@@ -64,6 +102,46 @@ async def categorize(packet: ContentPacket, taxonomy: TaxonomyCache) -> Category
             raise
 
     return _parse_result(result_json)
+
+
+async def _categorize_claude(packet: ContentPacket, taxonomy: TaxonomyCache) -> CategoryResult:
+    """Fast path for Claude/Anthropic content — skip full categorization."""
+    is_new = not any(s["name"].lower() == "claude" for s in taxonomy.spaces)
+
+    transcript_block = ""
+    if packet.transcript:
+        transcript_block = f"Transcript: {sanitize_for_prompt(packet.transcript)[:500]}\n"
+    user_note_block = ""
+    if packet.user_note:
+        user_note_block = f"User note: {sanitize_for_prompt(packet.user_note)}\n"
+
+    prompt = TITLE_SUMMARY_PROMPT.format(
+        content_type=packet.content_type.value,
+        transcript_block=transcript_block,
+        user_note_block=user_note_block,
+    )
+
+    try:
+        result_json = await asyncio.wait_for(
+            _call_gemini(PRIMARY_MODEL, prompt, None),
+            timeout=LATENCY_THRESHOLD,
+        )
+        data = json.loads(result_json.strip())
+        title = data.get("title", "Claude Content")
+        summary = data.get("summary", "")
+    except Exception:
+        title = packet.user_note[:60] if packet.user_note else "Claude Content"
+        summary = packet.user_note or packet.raw_input[:100]
+
+    return CategoryResult(
+        title=title,
+        category="Claude",
+        tags=["claude", "ai-tools"],
+        summary=summary,
+        is_new_category=is_new,
+        confidence=1.0,
+        reasoning="Matched Claude/Anthropic keyword",
+    )
 
 
 def _build_user_prompt(packet: ContentPacket, taxonomy: TaxonomyCache) -> str:
@@ -87,8 +165,12 @@ def _build_user_prompt(packet: ContentPacket, taxonomy: TaxonomyCache) -> str:
         if packet.source_url:
             content_type_str += f"\nSource URL: {packet.source_url}"
 
+    space_names = ", ".join(s["name"] for s in taxonomy.spaces) or "(none yet)"
+    tag_names = ", ".join(taxonomy.tags[:100]) or "(none yet)"
+
     return USER_PROMPT_TEMPLATE.format(
-        taxonomy=taxonomy.get_taxonomy_for_prompt(),
+        space_names=space_names,
+        tag_names=tag_names,
         content_type=content_type_str,
         transcript_block=transcript_block,
         user_note_block=user_note_block,
