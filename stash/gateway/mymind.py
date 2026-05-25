@@ -130,11 +130,18 @@ class MyMindGateway:
             if s["name"].lower().strip() == proposed_norm:
                 return s["id"]
 
-        # Fuzzy match (>85% similarity)
+        # Containment: "Tech" matches "Technology", "Career" matches "Career Development"
+        for s in self._spaces_cache:
+            existing_norm = s["name"].lower().strip()
+            if proposed_norm in existing_norm or existing_norm in proposed_norm:
+                logger.info("Substring matched '%s' -> '%s'", space_name, s["name"])
+                return s["id"]
+
+        # Fuzzy match (>80% similarity)
         for s in self._spaces_cache:
             ratio = SequenceMatcher(None, proposed_norm, s["name"].lower().strip()).ratio()
-            if ratio > 0.85:
-                logger.info("Fuzzy matched '%s' -> '%s'", space_name, s["name"])
+            if ratio > 0.80:
+                logger.info("Fuzzy matched '%s' -> '%s' (%.0f%%)", space_name, s["name"], ratio * 100)
                 return s["id"]
 
         new_space = await self.create_space(space_name)
