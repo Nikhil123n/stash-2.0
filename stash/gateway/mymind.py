@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import os
 from datetime import datetime, timezone
 
 import requests
@@ -20,36 +21,101 @@ class MymindUnavailableError(Exception):
     pass
 
 
+def _load_cookies_from_env() -> dict | None:
+    """Load cookies from environment variables (Railway deployment)."""
+    jwt = os.environ.get("MYMIND_JWT", "")
+    cid = os.environ.get("MYMIND_CID", "")
+    token = os.environ.get("MYMIND_AUTHENTICITY_TOKEN", "")
+    if jwt and cid and token:
+        return {"jwt": jwt, "cid": cid, "authenticity_token": token}
+    return None
+
+
+def _load_cookies_from_keyring() -> dict | None:
+    """Load cookies from system keyring (local Windows)."""
+    try:
+        import keyring
+        KEYRING_SERVICE = "mymind-api"
+        jwt = keyring.get_password(KEYRING_SERVICE, "jwt")
+        cid = keyring.get_password(KEYRING_SERVICE, "cid")
+        token = keyring.get_password(KEYRING_SERVICE, "authenticity_token")
+        if jwt and cid and token:
+            return {"jwt": jwt, "cid": cid, "authenticity_token": token}
+    except ImportError:
+        pass
+    return None
+
+
+def _create_client_with_cookies(cookies: dict):
+    """Create a MyMind client instance and inject cookies directly."""
+    from mymind_api.client import MyMind, _store_tokens
+
+    _store_tokens(cookies["jwt"], cookies["cid"], cookies["authenticity_token"])
+
+    client = MyMind()
+    client._jwt = cookies["jwt"]
+    client._cid = cookies["cid"]
+    client._authenticity_token = cookies["authenticity_token"]
+    return client
+
+
 class MyMindGateway:
     def __init__(self) -> None:
         self._client = None
         self._spaces_cache: list[dict] | None = None
+        self._auth_failed = False
 
     def _ensure_client(self) -> None:
         if self._client is not None:
             return
-        from mymind_api import MyMind
-        self._client = MyMind()
+
+        # Priority 1: env vars (Railway)
+        cookies = _load_cookies_from_env()
+        if cookies:
+            logger.info("  mymind auth: env vars")
+            self._client = _create_client_with_cookies(cookies)
+            return
+
+        # Priority 2: keyring (local Windows)
+        cookies = _load_cookies_from_keyring()
+        if cookies:
+            logger.info("  mymind auth: keyring")
+            self._client = _create_client_with_cookies(cookies)
+            return
+
+        # Priority 3: browser login (first-time setup)
+        raise AuthError(
+            "No mymind cookies found. Run 'mymind login' locally, "
+            "then 'python scripts/export_cookies.py' for Railway."
+        )
 
     async def _run_sync(self, func, *args, **kwargs):
         """Run a sync mymind client call in a thread executor with timeout."""
+        if self._auth_failed:
+            raise AuthError("mymind cookies expired. Re-auth required.")
+
         loop = asyncio.get_running_loop()
         call = functools.partial(func, *args, **kwargs)
-        return await asyncio.wait_for(
-            loop.run_in_executor(None, call),
-            timeout=10.0,
-        )
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(None, call),
+                timeout=10.0,
+            )
+        except PermissionError as e:
+            self._auth_failed = True
+            raise AuthError(
+                "mymind cookies expired. Run scripts/export_cookies.py on Windows, "
+                "update Railway env vars, redeploy."
+            ) from e
 
     async def test_connection(self) -> bool:
         try:
             self._ensure_client()
             result = await self._run_sync(self._client.test_connection)
             if not result:
-                raise AuthError("mymind auth failed. Run: mymind login")
+                raise AuthError("mymind connection test failed")
             return True
-        except ValueError as e:
-            raise AuthError(str(e)) from e
-        except PermissionError as e:
+        except (ValueError, AuthError) as e:
             raise AuthError(str(e)) from e
 
     async def _resolve_space_id(self, space_name: str) -> str | None:
@@ -63,7 +129,7 @@ class MyMindGateway:
 
         new_space = await self.create_space(space_name)
         if not new_space.get("id"):
-            logger.warning("Failed to create space '%s' — no ID returned", space_name)
+            logger.warning("Failed to create space '%s'", space_name)
             return None
         self._spaces_cache.append(new_space)
         return new_space["id"]

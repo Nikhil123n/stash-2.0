@@ -49,11 +49,26 @@ docker build -t stash .
 docker run --env-file .env stash
 ```
 
-### Deploy to Railway
+### Deploy to Railway (zero mymind credits)
 
-1. Connect GitHub repo to Railway
-2. Set all env vars in Railway dashboard
-3. Railway auto-detects the Dockerfile
+1. Run locally first to authenticate with mymind:
+   ```bash
+   python -m stash.bot
+   ```
+   Complete the browser login when prompted.
+
+2. Export cookies for Railway:
+   ```bash
+   python scripts/export_cookies.py
+   ```
+
+3. Add the three `MYMIND_*` values to Railway environment variables,
+   along with the other required vars.
+
+4. Deploy. Bot runs with zero mymind API credits.
+
+5. When bot DMs you "needs re-auth":
+   Repeat steps 1-3, update Railway vars, redeploy (~2 minutes).
 
 ## Testing
 

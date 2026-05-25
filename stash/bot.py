@@ -104,6 +104,9 @@ class StashBot(discord.Client):
     async def on_message(self, message: discord.Message) -> None:
         if message.author.id != self._config.OWNER_ID:
             return
+        if hasattr(self._gateway, '_auth_failed') and self._gateway._auth_failed:
+            await message.reply("Bot needs re-auth. Waiting for cookie refresh and redeploy.")
+            return
         if message.author.bot:
             return
         if message.channel.id in self._awaiting_confirmation:
@@ -278,9 +281,25 @@ class StashBot(discord.Client):
                     text, result.title, result.tags, result.category,
                 )
         except Exception as e:
-            error_str = str(e).lower()
-            if "401" in error_str or "auth" in error_str or "credential" in error_str:
-                await message.reply("mymind credentials expired. Please re-run auth setup.")
+            from stash.gateway.mymind import AuthError
+            if isinstance(e, AuthError) or "auth" in str(e).lower() or "expired" in str(e).lower():
+                logger.warning("mymind auth failed: %s", e)
+                await message.reply(
+                    "Bot needs re-auth. Run `scripts/export_cookies.py` on Windows, "
+                    "update Railway env vars, redeploy."
+                )
+                try:
+                    owner = await self.fetch_user(self._config.OWNER_ID)
+                    if owner:
+                        dm = await owner.create_dm()
+                        await dm.send(
+                            "**Stash re-auth required**\n"
+                            "mymind cookies expired. Run:\n"
+                            "```\npython scripts/export_cookies.py\n```\n"
+                            "Then update Railway env vars and redeploy."
+                        )
+                except discord.Forbidden:
+                    pass
             else:
                 logger.error("mymind save failed: %s", e)
                 await message.reply("mymind is having issues. Retrying in 30 seconds...")
