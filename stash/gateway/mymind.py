@@ -187,10 +187,7 @@ class MyMindGateway:
         payload: dict = {
             "title": title,
             "type": "Note",
-            "prose": {
-                "type": "doc",
-                "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}],
-            },
+            "content": {"type": "text/markdown", "body": text},
         }
 
         if tags:
@@ -262,7 +259,9 @@ class MyMindGateway:
         resp = await self._request("GET", "/spaces")
         data = resp.json()
         if isinstance(data, list):
-            return [{"id": s.get("id", ""), "name": s.get("name", "")} for s in data]
+            spaces = [{"id": s.get("id", ""), "name": s.get("name", "")} for s in data]
+            self._spaces_cache = spaces
+            return spaces
         return []
 
     async def get_tags(self) -> list[str]:

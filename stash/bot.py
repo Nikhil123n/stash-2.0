@@ -227,15 +227,14 @@ class StashBot(discord.Client):
         return result
 
     async def _save(self, message: discord.Message, packet: ContentPacket, result: CategoryResult) -> SavedCard | None:
-        try:
-            if result.is_new_category:
-                await self._taxonomy.on_new_space_created(result.category)
-            for tag in result.tags:
-                await self._taxonomy.on_new_tag_created(tag)
-        except NotImplementedError:
-            pass
-        except Exception as e:
-            logger.warning("Taxonomy update failed: %s", e)
+        # Update local taxonomy cache (no API calls — just in-memory)
+        if result.is_new_category and not any(
+            s["name"].lower() == result.category.lower() for s in self._taxonomy.spaces
+        ):
+            self._taxonomy.spaces.append({"id": "", "name": result.category})
+        for tag in result.tags:
+            if tag not in self._taxonomy.tags:
+                self._taxonomy.tags.append(tag)
 
         try:
             if packet.content_type == ContentType.IMAGE and packet.image_bytes:
