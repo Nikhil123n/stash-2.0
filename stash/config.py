@@ -14,8 +14,6 @@ class StashConfig(BaseModel):
     DISCORD_TOKEN: str
     STASH_OWNER_ID: int
     STASH_ENV: str
-    MYMIND_KID: str
-    MYMIND_SECRET: str
     GOOGLE_APPLICATION_CREDENTIALS: str
     GROQ_API_KEY: str
     GCP_PROJECT_ID: str = ""
@@ -80,8 +78,6 @@ def load_config() -> StashConfig:
         "DISCORD_TOKEN",
         "STASH_OWNER_ID",
         "STASH_ENV",
-        "MYMIND_KID",
-        "MYMIND_SECRET",
         "GOOGLE_APPLICATION_CREDENTIALS",
         "GROQ_API_KEY",
     ]

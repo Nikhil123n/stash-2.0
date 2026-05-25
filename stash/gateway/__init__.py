@@ -10,6 +10,6 @@ def create_gateway(config: StashConfig) -> MindGateway:
         return SandboxGateway(config.SANDBOX_FILE)
     elif config.ENV == "production":
         from stash.gateway.mymind import MyMindGateway
-        return MyMindGateway(config)
+        return MyMindGateway()
     else:
         raise ConfigError(f"Unknown STASH_ENV: {config.ENV}")

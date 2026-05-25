@@ -1,137 +1,132 @@
 import asyncio
-import base64
-import json
-import time
+from unittest.mock import MagicMock, patch
 
-import httpx
-import jwt
 import pytest
 
-from stash.config import StashConfig
-from stash.gateway.mymind import (
-    AuthError,
-    MyMindGateway,
-    RateLimitError,
-    _parse_rate_limit_headers,
-)
+from stash.gateway.mymind import AuthError, MyMindGateway
 
 
-def _make_config() -> StashConfig:
-    secret = base64.b64encode(b"test-secret-key-32bytes-long!!!!").decode()
-    return StashConfig(
-        DISCORD_TOKEN="test",
-        STASH_OWNER_ID=123,
-        STASH_ENV="production",
-        MYMIND_KID="test-kid-123",
-        MYMIND_SECRET=secret,
-        GOOGLE_APPLICATION_CREDENTIALS="/tmp/k.json",
-        GROQ_API_KEY="groq",
-    )
+def _make_gw_with_mock():
+    """Create a gateway with a mocked client injected directly."""
+    gw = MyMindGateway()
+    mock_client = MagicMock()
+    gw._client = mock_client
+    return gw, mock_client
 
 
-class TestJwtSigning:
-    def test_jwt_structure(self):
-        config = _make_config()
-        gw = MyMindGateway(config)
-
-        token = gw._sign_request("GET", "/spaces")
-
-        header = jwt.get_unverified_header(token)
-        assert header["alg"] == "HS256"
-        assert header["kid"] == "test-kid-123"
-
-        payload = jwt.decode(token, base64.b64decode(config.MYMIND_SECRET), algorithms=["HS256"])
-        assert payload["method"] == "GET"
-        assert payload["path"] == "/spaces"
-        assert "iat" in payload
-        assert "exp" in payload
-        assert payload["exp"] - payload["iat"] == 300
-
-    def test_jwt_different_per_request(self):
-        config = _make_config()
-        gw = MyMindGateway(config)
-
-        token1 = gw._sign_request("GET", "/spaces")
-        token2 = gw._sign_request("POST", "/objects")
-
-        p1 = jwt.decode(token1, base64.b64decode(config.MYMIND_SECRET), algorithms=["HS256"])
-        p2 = jwt.decode(token2, base64.b64decode(config.MYMIND_SECRET), algorithms=["HS256"])
-        assert p1["method"] == "GET"
-        assert p2["method"] == "POST"
-        assert p1["path"] == "/spaces"
-        assert p2["path"] == "/objects"
-
-
-class TestAuthError:
+class TestMyMindGateway:
     @pytest.mark.asyncio
-    async def test_401_raises_auth_error(self, httpx_mock):
-        httpx_mock.add_response(url="https://api.mymind.com/spaces", status_code=401)
-
-        config = _make_config()
-        gw = MyMindGateway(config)
-
-        with pytest.raises(AuthError, match="mymind auth failed"):
-            await gw._request("GET", "/spaces")
+    async def test_test_connection_success(self):
+        gw, mock_client = _make_gw_with_mock()
+        mock_client.test_connection.return_value = True
+        result = await gw.test_connection()
+        assert result is True
 
     @pytest.mark.asyncio
-    async def test_403_raises_auth_error(self, httpx_mock):
-        httpx_mock.add_response(url="https://api.mymind.com/objects", status_code=403)
+    async def test_test_connection_no_tokens_raises_auth_error(self):
+        gw = MyMindGateway()
+        with patch("mymind_api.client._load_tokens", return_value=None):
+            with pytest.raises(AuthError):
+                gw._client = None
+                await gw.test_connection()
 
-        config = _make_config()
-        gw = MyMindGateway(config)
-
-        with pytest.raises(AuthError, match="mymind auth failed"):
-            await gw._request("POST", "/objects")
-
-
-class TestRateLimit:
     @pytest.mark.asyncio
-    async def test_429_retries_with_header_backoff(self, httpx_mock):
-        httpx_mock.add_response(
-            url="https://api.mymind.com/tags",
-            status_code=429,
-            headers={"RateLimit": "r=0, t=1, w=300;policy=burst"},
-        )
-        httpx_mock.add_response(
-            url="https://api.mymind.com/tags",
-            json=[{"name": "python"}, {"name": "ai"}],
-        )
+    async def test_get_spaces(self):
+        gw, mock_client = _make_gw_with_mock()
+        mock_client.get_spaces.return_value = [
+            {"id": "abc", "name": "Tech", "color": "#fff", "card_count": 5},
+            {"id": "def", "name": "Career", "color": "#000", "card_count": 2},
+        ]
+        spaces = await gw.get_spaces()
+        assert len(spaces) == 2
+        assert spaces[0]["name"] == "Tech"
+        assert spaces[1]["id"] == "def"
 
-        config = _make_config()
-        gw = MyMindGateway(config)
-
+    @pytest.mark.asyncio
+    async def test_get_tags(self):
+        gw, mock_client = _make_gw_with_mock()
+        mock_client.get_tags.return_value = [
+            {"name": "python", "count": 10},
+            {"name": "ai", "count": 5},
+        ]
         tags = await gw.get_tags()
         assert tags == ["python", "ai"]
 
     @pytest.mark.asyncio
-    async def test_429_twice_raises_rate_limit_error(self, httpx_mock):
-        httpx_mock.add_response(url="https://api.mymind.com/tags", status_code=429)
-        httpx_mock.add_response(url="https://api.mymind.com/tags", status_code=429)
+    async def test_save_url_existing_space(self):
+        gw, mock_client = _make_gw_with_mock()
+        mock_client.save_url.return_value = {"id": "card123"}
+        mock_client.update_object.return_value = {}
+        mock_client.get_spaces.return_value = [
+            {"id": "sp1", "name": "Tech", "color": "#fff", "card_count": 3},
+        ]
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_client._request.return_value = mock_resp
+        mock_client._headers_json.return_value = {}
 
-        config = _make_config()
-        gw = MyMindGateway(config)
+        card = await gw.save_url(
+            url="https://example.com",
+            title="Test",
+            tags=["python"],
+            space="Tech",
+            note="A note",
+        )
+        assert card.mymind_id == "card123"
+        assert card.category == "Tech"
+        mock_client.save_url.assert_called_once_with("https://example.com", tags=["python"])
 
-        with pytest.raises(RateLimitError):
-            await gw.get_tags()
+    @pytest.mark.asyncio
+    async def test_save_url_no_space(self):
+        gw, mock_client = _make_gw_with_mock()
+        mock_client.save_url.return_value = {"id": "card456"}
+        mock_client.update_object.return_value = {}
 
+        card = await gw.save_url(
+            url="https://example.com",
+            title="No Space",
+            tags=[],
+            space="",
+            note="",
+        )
+        assert card.mymind_id == "card456"
+        mock_client._request.assert_not_called()
 
-class TestRateLimitHeaderParsing:
-    def test_parse_cost(self):
-        resp = httpx.Response(200, headers={"RateLimit-Cost": "10"})
-        info = _parse_rate_limit_headers(resp)
-        assert info["cost"] == 10
+    @pytest.mark.asyncio
+    async def test_create_space(self):
+        gw, mock_client = _make_gw_with_mock()
+        mock_client.create_space.return_value = {"id": "new_sp", "name": "New Space"}
 
-    def test_parse_remaining(self):
-        resp = httpx.Response(200, headers={
-            "RateLimit": "r=500, t=300, w=300;policy=burst, r=9000, t=2592000, w=2592000;policy=sustained",
-        })
-        info = _parse_rate_limit_headers(resp)
-        assert info["burst_remaining"] == 500
-        assert info["sustained_remaining"] == 9000
+        space = await gw.create_space("New Space")
+        assert space["id"] == "new_sp"
+        assert space["name"] == "New Space"
 
-    def test_parse_retry_after_on_exhausted(self):
-        resp = httpx.Response(429, headers={
-            "RateLimit": "r=0, t=45, w=300;policy=burst",
-        })
-        info = _parse_rate_limit_headers(resp)
-        assert info["retry_after"] == 45
+    @pytest.mark.asyncio
+    async def test_create_tag_is_noop(self):
+        gw = MyMindGateway()
+        result = await gw.create_tag("test-tag")
+        assert result == "test-tag"
+
+    @pytest.mark.asyncio
+    async def test_save_note(self):
+        gw, mock_client = _make_gw_with_mock()
+        mock_client.create_note.return_value = {"id": "note789"}
+        mock_client.get_spaces.return_value = [
+            {"id": "sp2", "name": "Ideas", "color": "#abc", "card_count": 1},
+        ]
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_client._request.return_value = mock_resp
+        mock_client._headers_json.return_value = {}
+
+        card = await gw.save_note(
+            text="My idea content",
+            title="My Idea",
+            tags=["brainstorm"],
+            space="Ideas",
+        )
+        assert card.mymind_id == "note789"
+        assert card.category == "Ideas"
+        mock_client.create_note.assert_called_once_with(
+            "My idea content", title="My Idea", tags=["brainstorm"]
+        )
