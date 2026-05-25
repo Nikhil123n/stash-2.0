@@ -285,19 +285,29 @@ class StashBot(discord.Client):
 
         try:
             if packet.content_type == ContentType.IMAGE and packet.image_bytes:
-                return await self._gateway.save_image(
+                card = await self._gateway.save_image(
                     packet.image_bytes, packet.image_mime or "image/png",
                     result.title, result.tags, result.category, result.summary,
                 )
             elif packet.source_url:
-                return await self._gateway.save_url(
+                card = await self._gateway.save_url(
                     packet.source_url, result.title, result.tags, result.category, result.summary,
                 )
             else:
                 text = packet.transcript or packet.page_text or packet.raw_input
-                return await self._gateway.save_note(
+                card = await self._gateway.save_note(
                     text, result.title, result.tags, result.category,
                 )
+
+            if card and result.verbatim_note and hasattr(self._gateway, "post_verbatim_note"):
+                try:
+                    await self._gateway.post_verbatim_note(card.mymind_id, result.verbatim_note)
+                    card._note_saved = True
+                except Exception as note_err:
+                    logger.warning("Note failed to attach: %s", note_err)
+                    card._note_saved = False
+
+            return card
         except Exception as e:
             from stash.gateway.mymind import AuthError
             if isinstance(e, AuthError) or "auth" in str(e).lower() or "expired" in str(e).lower():
@@ -330,6 +340,7 @@ class StashBot(discord.Client):
 
     def _format_saved(self, card: SavedCard) -> str:
         tags_str = ", ".join(card.tags) if card.tags else "none"
+        note_saved = getattr(card, "_note_saved", None)
         lines = [
             f"Saved to **{card.category}**",
             f"Title: {card.title}",
@@ -338,6 +349,10 @@ class StashBot(discord.Client):
         ]
         if card.source_url:
             lines.append(f"Source: {card.source_url}")
+        if note_saved is True:
+            lines.append("Your note saved to Mind Notes")
+        elif note_saved is False:
+            lines.append("Saved (note failed to attach)")
         return "\n".join(lines)
 
 

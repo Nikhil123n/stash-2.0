@@ -101,7 +101,9 @@ async def categorize(packet: ContentPacket, taxonomy: TaxonomyCache) -> Category
             logger.error("Fallback model also failed: %s", fallback_err)
             raise
 
-    return _parse_result(result_json)
+    result = _parse_result(result_json)
+    result.verbatim_note = packet.user_note
+    return result
 
 
 async def _categorize_claude(packet: ContentPacket, taxonomy: TaxonomyCache) -> CategoryResult:
@@ -141,6 +143,7 @@ async def _categorize_claude(packet: ContentPacket, taxonomy: TaxonomyCache) -> 
         is_new_category=is_new,
         confidence=1.0,
         reasoning="Matched Claude/Anthropic keyword",
+        verbatim_note=packet.user_note,
     )
 
 
@@ -153,7 +156,7 @@ def _build_user_prompt(packet: ContentPacket, taxonomy: TaxonomyCache) -> str:
     user_note_block = ""
     if packet.user_note:
         safe_note = sanitize_for_prompt(packet.user_note)
-        user_note_block = f"User note: {safe_note}\n"
+        user_note_block = f"User's own note (treat as ground truth for categorization): {safe_note}\n"
 
     image_block = ""
     if packet.image_bytes:

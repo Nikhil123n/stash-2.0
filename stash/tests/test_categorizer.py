@@ -10,8 +10,8 @@ from stash.taxonomy import TaxonomyCache
 
 
 @pytest.fixture
-async def taxonomy():
-    gw = SandboxGateway("/tmp/test_cat_sandbox.json")
+async def taxonomy(tmp_path):
+    gw = SandboxGateway(str(tmp_path / "cat_sandbox.json"))
     await gw.initialize()
     await gw.create_space("Tech")
     await gw.create_space("Career")
@@ -37,7 +37,8 @@ class TestBuildUserPrompt:
         assert "python" in prompt
         assert "resume" in prompt
         assert "Transcript: A talk about async Python" in prompt
-        assert "User note: great tutorial" in prompt
+        assert "great tutorial" in prompt
+        assert "ground truth" in prompt
         assert "youtube_url" in prompt
         assert "ALWAYS prefer an existing space" in prompt
 
@@ -66,7 +67,8 @@ class TestBuildUserPrompt:
         prompt = _build_user_prompt(pkt, taxonomy)
         assert "extraction failed" in prompt
         assert "Source URL:" in prompt
-        assert "User note: fitness content" in prompt
+        assert "fitness content" in prompt
+        assert "ground truth" in prompt
 
     @pytest.mark.asyncio
     async def test_sanitization_applied(self, taxonomy):

@@ -8,6 +8,7 @@ from stash.models import ContentType
 
 URL_PATTERN = re.compile(r'(https?://[^\s<>]+)')
 MENTION_PATTERN = re.compile(r'<@!?\d+>')
+ANNOTATION_PATTERN = re.compile(r'\[\[(.+?)\]\]', re.DOTALL)
 
 YOUTUBE_DOMAINS = {"youtube.com", "youtu.be", "www.youtube.com", "m.youtube.com"}
 REEL_DOMAINS = {
@@ -48,33 +49,52 @@ def _strip_mentions(text: str) -> str:
     return MENTION_PATTERN.sub("", text).strip()
 
 
+def extract_annotation(text: str) -> tuple[str, str | None]:
+    """Extract [[...]] annotation from text. Returns (clean_text, annotation)."""
+    import logging
+    matches = ANNOTATION_PATTERN.findall(text)
+    if not matches:
+        return text, None
+    if len(matches) > 1:
+        logging.getLogger(__name__).debug("multiple annotations found, using first")
+    annotation = matches[0].strip()
+    if not annotation:
+        return ANNOTATION_PATTERN.sub("", text).strip(), None
+    clean = ANNOTATION_PATTERN.sub("", text).strip()
+    return clean, annotation
+
+
 def route_message(message: discord.Message) -> tuple[ContentType, str, str | None]:
     """Classify a Discord message into content type, primary content, and optional user note."""
+
+    # Extract [[annotation]] before processing
+    raw_text = _strip_mentions(message.content)
+    text, annotation = extract_annotation(raw_text)
 
     # Check for image attachment
     for attachment in message.attachments:
         if attachment.content_type and attachment.content_type.startswith("image/"):
-            user_note = _strip_mentions(message.content) or None
+            user_note = annotation or text or None
             return ContentType.IMAGE, attachment.url, user_note
 
     # Check for audio attachment (voice note)
     for attachment in message.attachments:
         if attachment.content_type and attachment.content_type.startswith("audio/"):
-            user_note = _strip_mentions(message.content) or None
+            user_note = annotation or text or None
             return ContentType.VOICE_NOTE, attachment.url, user_note
 
     # Check for URLs in text
-    text = _strip_mentions(message.content)
     urls = URL_PATTERN.findall(text)
 
     if urls:
         url = urls[0]
         content_type = _classify_url(url)
-        user_note = _extract_user_note(text, url)
+        remaining = text.replace(url, "").strip()
+        user_note = annotation or remaining or None
         return content_type, url, user_note
 
     # Plain text
     if text:
-        return ContentType.TEXT, text, None
+        return ContentType.TEXT, text, annotation
 
     return ContentType.TEXT, "", None

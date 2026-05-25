@@ -151,6 +151,28 @@ class MyMindGateway:
         self._spaces_cache.append(new_space)
         return new_space["id"]
 
+    async def post_verbatim_note(self, card_id: str, note_text: str) -> bool:
+        """Post a user note to mymind's Mind Notes section. Returns True on success."""
+        self._ensure_client()
+        logger.debug("Posting user note to mymind Mind Notes")
+
+        def _post():
+            headers = self._client._headers()
+            headers["content-type"] = "text/markdown"
+            headers["origin"] = "https://access.mymind.com"
+            resp = requests.post(
+                f"https://access.mymind.com/objects/{card_id}/notes",
+                headers=headers,
+                data=note_text,
+                allow_redirects=False,
+            )
+            if resp.status_code in (302, 401, 403):
+                raise PermissionError("Auth failed posting note")
+            resp.raise_for_status()
+            return True
+
+        return await self._run_sync(_post)
+
     async def save_url(
         self, url: str, title: str, tags: list[str], space: str, note: str
     ) -> SavedCard:

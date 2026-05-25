@@ -37,6 +37,7 @@ class CategoryResult:
     is_new_category: bool = False
     confidence: float = 0.0
     reasoning: str | None = None
+    verbatim_note: str | None = None
 
 
 @dataclass

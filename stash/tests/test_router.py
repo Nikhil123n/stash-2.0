@@ -3,7 +3,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from stash.models import ContentType
-from stash.router import route_message
+from stash.router import extract_annotation, route_message
 
 
 def _make_msg(content="", attachments=None):
@@ -105,3 +105,42 @@ class TestRouteMessage:
         ct, primary, note = route_message(msg)
         assert ct == ContentType.TEXT
         assert primary == ""
+
+    def test_annotation_with_url(self):
+        msg = _make_msg("https://youtube.com/watch?v=abc [[great tutorial on async]]")
+        ct, primary, note = route_message(msg)
+        assert ct == ContentType.YOUTUBE_URL
+        assert "abc" in primary
+        assert note == "great tutorial on async"
+
+    def test_annotation_only(self):
+        msg = _make_msg("https://example.com [[save for later]]")
+        ct, primary, note = route_message(msg)
+        assert ct == ContentType.UNKNOWN_URL
+        assert note == "save for later"
+
+
+class TestExtractAnnotation:
+    def test_basic(self):
+        text, ann = extract_annotation("https://x.com/post [[my note here]]")
+        assert text == "https://x.com/post"
+        assert ann == "my note here"
+
+    def test_empty_brackets(self):
+        text, ann = extract_annotation("https://x.com [[]]")
+        assert ann is None
+        assert "https://x.com" in text
+
+    def test_none_present(self):
+        text, ann = extract_annotation("just a regular message")
+        assert text == "just a regular message"
+        assert ann is None
+
+    def test_multiline(self):
+        text, ann = extract_annotation("url [[line1\nline2]]")
+        assert ann == "line1\nline2"
+
+    def test_url_inside_annotation(self):
+        text, ann = extract_annotation("check [[https://notion.so/mypage]]")
+        assert ann == "https://notion.so/mypage"
+        assert text == "check"
