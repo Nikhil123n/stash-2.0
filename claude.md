@@ -74,6 +74,20 @@ All 14 steps complete. 44 tests passing.
 
 
 
+\## Branch Strategy
+
+| Branch | Auth | Credits | When to use |
+|--------|------|---------|-------------|
+| main | JWT/KID/SECRET | ~10-100/save | Deploy to Railway |
+| stable/cookie-local | Browser cookies | Zero | Run locally on Windows |
+
+Switch: `git checkout stable/cookie-local`
+Switch: `git checkout main`
+
+Never merge these into each other — they are permanent parallel implementations of the same gateway interface. Only merge bug fixes in shared code (bot.py, categorizer.py, extractor/, taxonomy.py) using `git cherry-pick`.
+
+
+
 \## Known gotchas
 
 - YouTube downloads blocked by bot detection on local Windows (works in Docker/cloud with clean IP)
