@@ -8,17 +8,24 @@ import traceback
 
 import discord
 
+from stash.agent import AgentResult, PendingTool, execute_pending, handle_text
 from stash.alerts import DiscordAlertHandler, send_alert
+from stash.categorizer import FALLBACK_MODEL as CAT_FALLBACK
+from stash.categorizer import PRIMARY_MODEL as CAT_PRIMARY
 from stash.categorizer import categorize
+from stash.commands import try_handle as try_command
 from stash.config import load_config, StashConfig
 from stash.extractor.audio import check_audio_size, extract_audio
 from stash.extractor.image import extract_image
 from stash.extractor.video import extract_video
 from stash.gateway import create_gateway
 from stash.gateway.interface import MindGateway
+from stash.help import STARTUP_GREETING_TEMPLATE
 from stash.models import CategoryResult, ContentPacket, ContentType, SavedCard
 from stash.router import route_message
+from stash.settings import MODEL_LABELS, Settings, fallback_for
 from stash.taxonomy import TaxonomyCache
+from stash.tools import Tool, build_registry
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,7 +36,8 @@ logger = logging.getLogger("stash")
 CONFIDENCE_THRESHOLD = 0.75
 CONFIRMATION_TIMEOUT = 300  # 5 minutes
 GATEWAY_MODE = "cookie-local"  # "jwt-railway" on main branch, "cookie-local" on stable/cookie-local
-VERSION = "2.0.0"
+VERSION = "2.1.0"
+SETTINGS_FILE = "stash_settings.json"
 
 
 class StashBot(discord.Client):
@@ -41,8 +49,20 @@ class StashBot(discord.Client):
         self._config = config
         self._gateway: MindGateway | None = None
         self._taxonomy: TaxonomyCache | None = None
+        self._tool_registry: dict[str, Tool] = {}
+        self._settings: Settings = Settings.load(
+            os.path.join(self._settings_dir(config), SETTINGS_FILE)
+        )
         self._awaiting_confirmation: set[int] = set()  # channel IDs waiting for user reply
         self._processed: set[int] = set()  # message IDs already handled (kept permanently)
+
+    @staticmethod
+    def _settings_dir(config: StashConfig) -> str:
+        # Live alongside the sandbox file when in sandbox mode; otherwise the
+        # tmp dir (Railway-friendly: persists across the process's lifetime).
+        if config.ENV == "sandbox":
+            return os.path.dirname(os.path.abspath(config.SANDBOX_FILE)) or "."
+        return config.TMP_DIR
 
     async def setup_hook(self) -> None:
         logger.info("=" * 50)
@@ -75,6 +95,9 @@ class StashBot(discord.Client):
         await self._taxonomy.initialize()
         logger.info("  %d spaces, %d tags loaded", len(self._taxonomy.spaces), len(self._taxonomy.tags))
 
+        self._tool_registry = build_registry(self._gateway)
+        logger.info("  %d agent tools registered", len(self._tool_registry))
+
         logger.info("[4/4] Services ready")
 
     def _wipe_tmp(self) -> None:
@@ -98,13 +121,26 @@ class StashBot(discord.Client):
         if owner:
             try:
                 dm = await owner.create_dm()
-                await dm.send(
-                    f"**Stash v{VERSION} online**\n"
-                    f"Gateway: `{GATEWAY_MODE}`\n"
-                    f"Spaces: {len(self._taxonomy.spaces)} | Tags: {len(self._taxonomy.tags)}"
-                )
+                await dm.send(self._startup_message())
             except discord.Forbidden:
                 logger.warning("Cannot DM owner — DMs disabled")
+
+    def _startup_message(self) -> str:
+        agent_model = self._settings.agent_model
+        return STARTUP_GREETING_TEMPLATE.format(
+            version=VERSION,
+            gateway_mode=GATEWAY_MODE,
+            env=self._config.ENV,
+            agent_label=MODEL_LABELS.get(agent_model, agent_model),
+            fallback_label=MODEL_LABELS.get(
+                fallback_for(agent_model), fallback_for(agent_model)
+            ),
+            categorizer_primary=CAT_PRIMARY,
+            categorizer_fallback=CAT_FALLBACK,
+            space_count=len(self._taxonomy.spaces),
+            tag_count=len(self._taxonomy.tags),
+            tool_count=len(self._tool_registry),
+        )
 
     async def on_error(self, event: str, *args, **kwargs) -> None:
         error_text = traceback.format_exc()[:500]
@@ -142,6 +178,13 @@ class StashBot(discord.Client):
     async def _handle_message(self, message: discord.Message) -> None:
         content_type, primary, user_note = route_message(message)
 
+        # Text-only messages with no URL/no attachment go to the interactive
+        # agent (list spaces, search, etc.). URLs and attachments stay on
+        # the capture pipeline.
+        if content_type == ContentType.TEXT and not message.attachments:
+            await self._handle_agent(message, primary, user_note)
+            return
+
         packet = await self._extract(message, content_type, primary, user_note)
         if packet is None:
             return
@@ -167,6 +210,68 @@ class StashBot(discord.Client):
                 card = await self._save(message, packet, confirmed_result)
                 if card:
                     await message.reply(self._format_saved(card))
+
+    async def _handle_agent(
+        self, message: discord.Message, text: str, annotation: str | None
+    ) -> None:
+        """Route a plain-text message through prefix commands or the agent."""
+        prompt = text or ""
+        if annotation:
+            prompt = f"{prompt}\n[[{annotation}]]" if prompt else annotation
+        if not prompt.strip():
+            return
+
+        # Prefix commands (/help, /model, /stats) bypass Gemini entirely.
+        cmd_result = await try_command(
+            prompt, settings=self._settings, registry=self._tool_registry
+        )
+        if cmd_result.handled:
+            await message.reply(cmd_result.text[:1900])
+            return
+
+        result = await handle_text(
+            prompt,
+            registry=self._tool_registry,
+            taxonomy=self._taxonomy,
+            model=self._settings.agent_model,
+        )
+
+        if result.pending:
+            await self._confirm_and_execute(message, result.pending)
+            return
+
+        reply_text = result.text or "Hmm, no answer to give."
+        await message.reply(reply_text[:1900])
+
+    async def _confirm_and_execute(
+        self, message: discord.Message, pending: PendingTool
+    ) -> None:
+        """Ask the user to confirm a destructive tool; execute on 'ok'."""
+        await message.reply(
+            f"{pending.preview}\nReply `ok` to confirm, anything else cancels."
+        )
+
+        channel_id = message.channel.id
+        self._awaiting_confirmation.add(channel_id)
+
+        def check(m: discord.Message) -> bool:
+            return m.author.id == self._config.OWNER_ID and m.channel.id == channel_id
+
+        try:
+            reply = await self.wait_for("message", check=check, timeout=CONFIRMATION_TIMEOUT)
+        except asyncio.TimeoutError:
+            await message.reply("Timed out — not running.")
+            return
+        finally:
+            self._awaiting_confirmation.discard(channel_id)
+
+        text = reply.content.strip().lower()
+        if text not in ("ok", "yes", "y", "confirm"):
+            await message.reply("Cancelled.")
+            return
+
+        executed = await execute_pending(pending, self._tool_registry)
+        await message.reply((executed.text or "Done.")[:1900])
 
     async def _extract(
         self, message: discord.Message, content_type: ContentType, primary: str, user_note: str | None
@@ -341,8 +446,17 @@ class StashBot(discord.Client):
     def _format_saved(self, card: SavedCard) -> str:
         tags_str = ", ".join(card.tags) if card.tags else "none"
         note_saved = getattr(card, "_note_saved", None)
+        space_assigned = getattr(card, "_space_assigned", None)
+
+        if not card.category:
+            header = "Saved (no space)"
+        elif space_assigned is False:
+            header = f"Saved (couldn't assign to **{card.category}** — left in Everything)"
+        else:
+            header = f"Saved to **{card.category}**"
+
         lines = [
-            f"Saved to **{card.category}**",
+            header,
             f"Title: {card.title}",
             f"Tags: {tags_str}",
             f"Summary: {card.summary[:120]}",

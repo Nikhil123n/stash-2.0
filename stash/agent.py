@@ -1,0 +1,362 @@
+"""Gemini function-calling orchestrator.
+
+Plain-text Discord messages flow through `handle_text()`. The agent asks
+Gemini to pick a tool from the registry; if it picks a safe tool, we run it
+and return a formatted reply. If it picks a destructive tool, we surface a
+`PendingTool` so the bot can ask the user for confirmation. If no tool is
+picked, we fall back to Gemini's conversational text.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+from dataclasses import dataclass, field
+from typing import Any
+
+from stash.security import sanitize_for_prompt
+from stash.settings import MODEL_FLASH
+from stash.taxonomy import TaxonomyCache
+from stash.tools import Tool
+
+
+logger = logging.getLogger(__name__)
+
+
+DEFAULT_AGENT_MODEL = MODEL_FLASH
+AGENT_TIMEOUT = 20.0
+
+SYSTEM_PROMPT = (
+    "You are Stash, a personal mymind assistant chatting with the owner in "
+    "Discord. Your job is to help them navigate, organize and interact with "
+    "their saved cards. You have a set of tools (functions) for reading and "
+    "modifying mymind. Rules:\n"
+    "1. When the user asks a question that needs live data from mymind "
+    "(spaces, cards, search results), CALL the matching tool. Do not "
+    "fabricate spaces, card titles or counts.\n"
+    "2. When the user is just chatting, replying or thinking out loud, "
+    "answer conversationally without calling a tool. Be concise, warm and a "
+    "bit playful.\n"
+    "3. For destructive actions (delete_card, move_card_to_space), call the "
+    "tool — the host system will request user confirmation before it runs.\n"
+    "4. Prefer fuzzy matching on existing space names rather than inventing "
+    "new ones. If a space the user mentions doesn't exist, ask if they want "
+    "you to create it before saving anything there.\n"
+)
+
+
+@dataclass
+class PendingTool:
+    """A destructive tool call awaiting user confirmation."""
+    name: str
+    args: dict
+    preview: str
+
+
+@dataclass
+class AgentResult:
+    text: str | None = None
+    pending: PendingTool | None = None
+    tool_name: str | None = None
+    tool_args: dict | None = None
+    tool_result: dict | None = None
+    error: str | None = None
+
+
+# ── Vertex glue ──────────────────────────────────────────────────────────
+
+
+_vertexai_initialized = False
+
+
+def _ensure_vertex_init() -> None:
+    global _vertexai_initialized
+    if _vertexai_initialized:
+        return
+    import vertexai
+    vertexai.init(
+        project=os.environ.get("GCP_PROJECT_ID"),
+        location=os.environ.get("GCP_LOCATION", "us-central1"),
+    )
+    _vertexai_initialized = True
+
+
+async def _call_gemini_with_tools(
+    user_text: str,
+    system_prompt: str,
+    registry: dict[str, Tool],
+    model_name: str = DEFAULT_AGENT_MODEL,
+) -> dict:
+    """Call Gemini with function-calling enabled.
+
+    Returns a normalized dict:
+        {"function_call": {"name": str, "args": dict} | None,
+         "text": str | None}
+    """
+    _ensure_vertex_init()
+    from vertexai.generative_models import (
+        FunctionDeclaration,
+        GenerativeModel,
+        Part,
+        Tool as VertexTool,
+    )
+
+    declarations = [
+        FunctionDeclaration(
+            name=t.name,
+            description=t.description,
+            parameters=t.parameters,
+        )
+        for t in registry.values()
+    ]
+    vtool = VertexTool(function_declarations=declarations)
+
+    loop = asyncio.get_running_loop()
+
+    def _sync_call() -> dict:
+        model = GenerativeModel(
+            model_name,
+            system_instruction=system_prompt,
+            tools=[vtool],
+        )
+        response = model.generate_content(
+            [Part.from_text(user_text)],
+            generation_config={"temperature": 0.2, "max_output_tokens": 1024},
+        )
+        try:
+            part = response.candidates[0].content.parts[0]
+        except (IndexError, AttributeError):
+            return {"function_call": None, "text": None}
+
+        fc = getattr(part, "function_call", None)
+        if fc and getattr(fc, "name", None):
+            args = {}
+            raw_args = getattr(fc, "args", None)
+            if raw_args is not None:
+                try:
+                    args = dict(raw_args)
+                except Exception:
+                    args = {}
+            return {"function_call": {"name": fc.name, "args": args}, "text": None}
+
+        text = ""
+        try:
+            text = response.text
+        except Exception:
+            text = getattr(part, "text", "") or ""
+        return {"function_call": None, "text": text or None}
+
+    return await asyncio.wait_for(
+        loop.run_in_executor(None, _sync_call),
+        timeout=AGENT_TIMEOUT,
+    )
+
+
+# ── Result formatting ────────────────────────────────────────────────────
+
+
+def _format_tool_result(tool_name: str, args: dict, result: dict) -> str:
+    """Render a tool result as a Discord-friendly text reply."""
+    if not result.get("ok", False):
+        return f"Couldn't do that: {result.get('error', 'unknown error')}"
+
+    if tool_name == "list_spaces":
+        spaces = result.get("spaces", [])
+        if not spaces:
+            return "No spaces yet in your mymind."
+        lines = [f"**{len(spaces)} space(s):**"]
+        for s in spaces:
+            cnt = s.get("card_count", 0)
+            lines.append(f"- {s['name']} ({cnt})")
+        return "\n".join(lines)
+
+    if tool_name == "list_cards_in_space":
+        cards = result.get("cards", [])
+        space = result.get("space", "?")
+        if not cards:
+            return f"**{space}** has no cards yet."
+        lines = [f"**{space}** ({result.get('count', len(cards))} cards):"]
+        for c in cards:
+            line = f"- {c['title']}"
+            if c.get("source_url"):
+                line += f" — <{c['source_url']}>"
+            lines.append(line)
+        return "\n".join(lines)
+
+    if tool_name in ("search_cards", "recent_cards"):
+        cards = result.get("cards", [])
+        if not cards:
+            return "No cards matched."
+        lines = [f"**{len(cards)} card(s):**"]
+        for c in cards:
+            line = f"- {c['title']}"
+            if c.get("source_url"):
+                line += f" — <{c['source_url']}>"
+            lines.append(line)
+        return "\n".join(lines)
+
+    if tool_name == "create_space":
+        if result.get("created"):
+            return f"Created space **{result['name']}**."
+        return f"Space **{result['name']}** already exists."
+
+    if tool_name == "save_note":
+        space = result.get("space")
+        line = f"Saved note **{result.get('title', '(untitled)')}**"
+        if space:
+            line += f" to **{space}**"
+        return line + "."
+
+    if tool_name == "move_card_to_space":
+        if result.get("ok"):
+            extra = " (space created)" if result.get("space_created") else ""
+            return f"Moved card to **{result['space']}**{extra}."
+        return "Move failed."
+
+    if tool_name == "delete_card":
+        return "Card deleted." if result.get("ok") else "Delete failed."
+
+    if tool_name == "library_stats":
+        lines = [
+            "**Library overview:**",
+            f"- Spaces: {result.get('space_count', 0)}",
+            f"- Tags: {result.get('tag_count', 0)}",
+            f"- Cards seen (recent window): {result.get('total_cards_seen', 0)}",
+            f"- Saved in last 7 days: {result.get('saved_this_week', 0)}",
+        ]
+        largest = result.get("largest_spaces") or []
+        if largest:
+            lines.append("- Largest spaces: " + ", ".join(
+                f"{s['name']} ({s['count']})" for s in largest
+            ))
+        return "\n".join(lines)
+
+    if tool_name == "cards_this_week":
+        cards = result.get("cards", [])
+        if not cards:
+            return f"Nothing saved in the last {result.get('days', 7)} days."
+        lines = [f"**{len(cards)} card(s) in last {result.get('days', 7)} days:**"]
+        for c in cards:
+            line = f"- {c['title']}"
+            if c.get("source_url"):
+                line += f" — <{c['source_url']}>"
+            lines.append(line)
+        return "\n".join(lines)
+
+    if tool_name == "random_card":
+        c = result.get("card") or {}
+        line = f"**Random card:** {c.get('title', '(untitled)')}"
+        if c.get("source_url"):
+            line += f"\n<{c['source_url']}>"
+        return line
+
+    return f"Done: {result}"
+
+
+def _build_confirmation_preview(tool: Tool, args: dict) -> str:
+    if tool.confirm_template:
+        try:
+            return tool.confirm_template.format(**args)
+        except Exception:
+            pass
+    return f"Run `{tool.name}` with {args}?"
+
+
+# ── Entry points ─────────────────────────────────────────────────────────
+
+
+def _taxonomy_block(taxonomy: TaxonomyCache | None) -> str:
+    if not taxonomy:
+        return ""
+    spaces = ", ".join(s.get("name", "") for s in taxonomy.spaces) or "(none)"
+    tags = ", ".join(taxonomy.tags[:50]) or "(none)"
+    return f"\n\nKnown spaces: {spaces}\nKnown tags: {tags}"
+
+
+async def handle_text(
+    text: str,
+    *,
+    registry: dict[str, Tool],
+    taxonomy: TaxonomyCache | None = None,
+    model: str = DEFAULT_AGENT_MODEL,
+) -> AgentResult:
+    """Handle a plain-text user message. Picks a tool via Gemini or chats."""
+    safe = sanitize_for_prompt(text)
+    prompt = f"User message: {safe}{_taxonomy_block(taxonomy)}"
+
+    try:
+        response = await _call_gemini_with_tools(
+            prompt, SYSTEM_PROMPT, registry, model_name=model
+        )
+    except asyncio.TimeoutError:
+        return AgentResult(error="Agent timed out.", text="Took too long — try again?")
+    except Exception as e:
+        logger.exception("Agent call failed")
+        return AgentResult(error=str(e), text="Something went sideways. Try again?")
+
+    fc = response.get("function_call")
+    if not fc:
+        text_reply = response.get("text") or "Not sure how to help with that yet."
+        return AgentResult(text=text_reply)
+
+    tool_name = fc["name"]
+    tool_args = fc.get("args") or {}
+    tool = registry.get(tool_name)
+    if not tool:
+        return AgentResult(
+            error=f"Unknown tool {tool_name}",
+            text="I picked a tool I don't actually have. Try rephrasing?",
+        )
+
+    if tool.destructive:
+        return AgentResult(
+            pending=PendingTool(
+                name=tool_name,
+                args=tool_args,
+                preview=_build_confirmation_preview(tool, tool_args),
+            ),
+        )
+
+    try:
+        result = await tool.handler(**tool_args)
+    except TypeError as e:
+        return AgentResult(
+            error=str(e),
+            text=f"Tool `{tool_name}` got bad arguments. {e}",
+        )
+    except Exception as e:
+        logger.exception("Tool execution failed: %s", tool_name)
+        return AgentResult(
+            error=str(e),
+            text=f"Tool `{tool_name}` failed: {str(e)[:120]}",
+        )
+
+    text_reply = _format_tool_result(tool_name, tool_args, result)
+    return AgentResult(
+        text=text_reply,
+        tool_name=tool_name,
+        tool_args=tool_args,
+        tool_result=result,
+    )
+
+
+async def execute_pending(
+    pending: PendingTool,
+    registry: dict[str, Tool],
+) -> AgentResult:
+    """Run a previously-confirmed destructive tool call."""
+    tool = registry.get(pending.name)
+    if not tool:
+        return AgentResult(error=f"Unknown tool {pending.name}", text="Tool vanished.")
+    try:
+        result = await tool.handler(**pending.args)
+    except Exception as e:
+        logger.exception("Confirmed tool failed: %s", pending.name)
+        return AgentResult(error=str(e), text=f"Failed: {str(e)[:120]}")
+    return AgentResult(
+        text=_format_tool_result(pending.name, pending.args, result),
+        tool_name=pending.name,
+        tool_args=pending.args,
+        tool_result=result,
+    )
