@@ -73,20 +73,41 @@ CLAUDE_KEYWORDS = [
 #   "put this in Claude"
 #   "save to LinkedIn"
 #   "add to Career Development"
+#   "Move this card into the LinkedIn space"
+#   "Save this article to Tech"
+#   "Put this video in Career Development"
+#   "stash the screenshot in Design"
 #   "-> Tech"  /  "=> Tech"
 #   "in:LinkedIn"
 #   "space: Claude"
 _DIRECTIVE_PATTERNS = [
+    # Verb-anchored at the start of the note. Allows up to 5 intervening
+    # words between the verb (move/put/save/...) and the preposition
+    # (in/into/to/under) so phrasings like "Move this card into the
+    # LinkedIn space" work.
     re.compile(
-        r"\b(?:put|save|add|move|stash|drop)\s+(?:this|it)?\s*"
-        r"(?:in(?:to)?|to|under)\s+(?:the\s+)?"
-        r"(?:space\s+called\s+|space\s+|the\s+)?"
-        r"['\"]?(?P<name>[A-Za-z0-9 _\-&/+]+?)['\"]?"
-        r"\s*(?:space|category|collection)?\s*$",
+        r"^\s*(?:put|save|add|move|stash|drop|file)\b"
+        r"(?:\s+\w+){0,5}?"
+        r"\s+(?:in(?:to)?|to|under)\s+"
+        r"(?:the\s+)?"
+        r"(?:space\s+(?:called\s+|named\s+)?)?"
+        r"['\"]?(?P<name>[A-Za-z0-9][A-Za-z0-9 _\-&/+]*?)['\"]?"
+        r"\s*(?:space|category|collection)?"
+        r"\s*[.!?]?\s*$",
         re.IGNORECASE,
     ),
-    re.compile(r"^(?:->|=>)\s*['\"]?(?P<name>[A-Za-z0-9 _\-&/+]+?)['\"]?\s*$"),
-    re.compile(r"\b(?:in|to|space|category)\s*[:=]\s*['\"]?(?P<name>[A-Za-z0-9 _\-&/+]+?)['\"]?\s*$", re.IGNORECASE),
+    # Arrow shortcuts: "-> Tech", "=> Career Development"
+    re.compile(
+        r"^\s*(?:->|=>)\s*['\"]?(?P<name>[A-Za-z0-9 _\-&/+]+?)['\"]?\s*$"
+    ),
+    # Colon / equals shortcuts: "in: LinkedIn", "space: Claude",
+    # "category=Tech"
+    re.compile(
+        r"\b(?:in|to|space|category)\s*[:=]\s*"
+        r"['\"]?(?P<name>[A-Za-z0-9 _\-&/+]+?)['\"]?"
+        r"\s*[.!?]?\s*$",
+        re.IGNORECASE,
+    ),
 ]
 
 _DIRECTIVE_STOP_WORDS = {

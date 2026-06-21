@@ -17,8 +17,10 @@ Use natural directives in the same message:
 - `put this in Claude — <url>`
 - `save to LinkedIn <url>`
 - `add to Career Development <url>`
+- `move this card into the LinkedIn space <url>`
 - `-> Tech <url>`
 
+Intervening words like "card", "video", "article" are fine.
 If the space doesn't exist, I create it. If I can't assign, I'll say so honestly.
 
 **Ask things (no URL needed — just talk to me)**
@@ -35,6 +37,9 @@ If the space doesn't exist, I create it. If I can't assign, I'll say so honestly
 - `move card <id> to <space>` — I'll ask before moving
 - `create a space called LinkedIn`
 - `save a note: groceries tomorrow`
+
+Every save reply, search result and listing now shows the card ID
+in backticks — copy it straight into a move / delete command.
 
 **Bot commands**
 - `/help` — this guide

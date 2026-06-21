@@ -178,10 +178,7 @@ def _format_tool_result(tool_name: str, args: dict, result: dict) -> str:
             return f"**{space}** has no cards yet."
         lines = [f"**{space}** ({result.get('count', len(cards))} cards):"]
         for c in cards:
-            line = f"- {c['title']}"
-            if c.get("source_url"):
-                line += f" — <{c['source_url']}>"
-            lines.append(line)
+            lines.append(_render_card_line(c))
         return "\n".join(lines)
 
     if tool_name in ("search_cards", "recent_cards"):
@@ -190,32 +187,36 @@ def _format_tool_result(tool_name: str, args: dict, result: dict) -> str:
             return "No cards matched."
         lines = [f"**{len(cards)} card(s):**"]
         for c in cards:
-            line = f"- {c['title']}"
-            if c.get("source_url"):
-                line += f" — <{c['source_url']}>"
-            lines.append(line)
+            lines.append(_render_card_line(c))
         return "\n".join(lines)
 
     if tool_name == "create_space":
         if result.get("created"):
-            return f"Created space **{result['name']}**."
-        return f"Space **{result['name']}** already exists."
+            return f"Created space **{result['name']}** (id: `{result.get('id', '')}`)."
+        return f"Space **{result['name']}** already exists (id: `{result.get('id', '')}`)."
 
     if tool_name == "save_note":
         space = result.get("space")
         line = f"Saved note **{result.get('title', '(untitled)')}**"
         if space:
             line += f" to **{space}**"
-        return line + "."
+        if result.get("id"):
+            line += f"\nID: `{result['id']}`"
+        return line
 
     if tool_name == "move_card_to_space":
         if result.get("ok"):
             extra = " (space created)" if result.get("space_created") else ""
-            return f"Moved card to **{result['space']}**{extra}."
+            return (
+                f"Moved card `{result.get('card_id', '')}` to **{result['space']}**"
+                f"{extra}."
+            )
         return "Move failed."
 
     if tool_name == "delete_card":
-        return "Card deleted." if result.get("ok") else "Delete failed."
+        if result.get("ok"):
+            return f"Card `{result.get('card_id', '')}` deleted."
+        return "Delete failed."
 
     if tool_name == "library_stats":
         lines = [
@@ -238,20 +239,29 @@ def _format_tool_result(tool_name: str, args: dict, result: dict) -> str:
             return f"Nothing saved in the last {result.get('days', 7)} days."
         lines = [f"**{len(cards)} card(s) in last {result.get('days', 7)} days:**"]
         for c in cards:
-            line = f"- {c['title']}"
-            if c.get("source_url"):
-                line += f" — <{c['source_url']}>"
-            lines.append(line)
+            lines.append(_render_card_line(c))
         return "\n".join(lines)
 
     if tool_name == "random_card":
         c = result.get("card") or {}
-        line = f"**Random card:** {c.get('title', '(untitled)')}"
+        line = f"**Random card:** {c.get('title') or '(untitled)'}"
+        if c.get("id"):
+            line += f"\nID: `{c['id']}`"
         if c.get("source_url"):
             line += f"\n<{c['source_url']}>"
         return line
 
     return f"Done: {result}"
+
+
+def _render_card_line(c: dict) -> str:
+    """One bullet line for a card in a list: ID then title then URL."""
+    cid = c.get("id") or ""
+    title = c.get("title") or "(untitled)"
+    line = f"- `{cid}` {title}" if cid else f"- {title}"
+    if c.get("source_url"):
+        line += f" — <{c['source_url']}>"
+    return line
 
 
 def _build_confirmation_preview(tool: Tool, args: dict) -> str:

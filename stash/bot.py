@@ -36,7 +36,7 @@ logger = logging.getLogger("stash")
 CONFIDENCE_THRESHOLD = 0.75
 CONFIRMATION_TIMEOUT = 300  # 5 minutes
 GATEWAY_MODE = "cookie-local"  # "jwt-railway" on main branch, "cookie-local" on stable/cookie-local
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 SETTINGS_FILE = "stash_settings.json"
 
 
@@ -458,6 +458,7 @@ class StashBot(discord.Client):
         lines = [
             header,
             f"Title: {card.title}",
+            f"ID: `{card.mymind_id}`" if card.mymind_id else "ID: (none)",
             f"Tags: {tags_str}",
             f"Summary: {card.summary[:120]}",
         ]

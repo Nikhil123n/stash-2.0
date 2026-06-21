@@ -184,6 +184,68 @@ class TestFormatters:
         out = _format_tool_result("list_spaces", {}, {"ok": False, "error": "nope"})
         assert "nope" in out
 
+    def test_list_cards_in_space_shows_ids(self):
+        out = _format_tool_result(
+            "list_cards_in_space",
+            {"space_name": "Claude"},
+            {
+                "ok": True, "space": "Claude", "count": 1,
+                "cards": [{"id": "abc123", "title": "Hello", "source_url": None}],
+            },
+        )
+        assert "`abc123`" in out
+        assert "Hello" in out
+
+    def test_search_cards_shows_ids(self):
+        out = _format_tool_result(
+            "search_cards",
+            {},
+            {"ok": True, "count": 1, "cards": [
+                {"id": "xyz", "title": "T", "source_url": "https://x"}
+            ]},
+        )
+        assert "`xyz`" in out
+        assert "https://x" in out
+
+    def test_random_card_shows_id(self):
+        out = _format_tool_result(
+            "random_card", {},
+            {"ok": True, "card": {"id": "r1", "title": "Surprise"}},
+        )
+        assert "`r1`" in out
+        assert "Surprise" in out
+
+    def test_save_note_shows_id(self):
+        out = _format_tool_result(
+            "save_note", {},
+            {"ok": True, "id": "n1", "title": "T", "space": "Life"},
+        )
+        assert "`n1`" in out
+        assert "Life" in out
+
+    def test_move_card_shows_id(self):
+        out = _format_tool_result(
+            "move_card_to_space",
+            {"card_id": "c1", "space_name": "Tech"},
+            {"ok": True, "card_id": "c1", "space": "Tech", "space_created": False},
+        )
+        assert "`c1`" in out
+        assert "Tech" in out
+
+    def test_delete_card_shows_id(self):
+        out = _format_tool_result(
+            "delete_card", {"card_id": "d1"},
+            {"ok": True, "card_id": "d1"},
+        )
+        assert "`d1`" in out
+
+    def test_create_space_shows_id(self):
+        out = _format_tool_result(
+            "create_space", {"name": "X"},
+            {"ok": True, "created": True, "name": "X", "id": "sp1"},
+        )
+        assert "`sp1`" in out
+
     def test_confirmation_preview_uses_template(self):
         from stash.tools import Tool
 

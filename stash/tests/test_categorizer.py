@@ -236,6 +236,31 @@ class TestParseSpaceDirective:
         long_phrase = "save to " + "word " * 10
         assert parse_space_directive(long_phrase) is None
 
+    # Intervening-noun phrasings (the bug user hit)
+    def test_move_this_card_into(self):
+        assert parse_space_directive(
+            "Move this card into the LinkedIn space"
+        ) == "LinkedIn"
+
+    def test_save_this_article_to(self):
+        assert parse_space_directive("Save this article to Tech") == "Tech"
+
+    def test_put_this_video_in(self):
+        assert parse_space_directive(
+            "Put this video in Career Development"
+        ) == "Career Development"
+
+    def test_stash_the_screenshot_in(self):
+        assert parse_space_directive("stash the screenshot in Design") == "Design"
+
+    def test_move_it_into_space_named(self):
+        assert parse_space_directive(
+            "move it into the space named Reels"
+        ) == "Reels"
+
+    def test_file_under(self):
+        assert parse_space_directive("file under Tech") == "Tech"
+
 
 class TestCategorizeWithDirective:
     @pytest.mark.asyncio
