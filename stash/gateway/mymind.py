@@ -116,8 +116,14 @@ class MyMindGateway:
         except (ValueError, AuthError) as e:
             raise AuthError(str(e)) from e
 
-    async def _resolve_space_id(self, space_name: str) -> str | None:
-        """Find space by name (fuzzy) or create it. Returns space ID or None if failed."""
+    async def _resolve_space_id(
+        self, space_name: str, create_if_missing: bool = True
+    ) -> tuple[str | None, bool]:
+        """Find space by name (fuzzy) or create it.
+
+        Returns (space_id, created). created=True if a new space was created in
+        this call. space_id is None if not found and not created.
+        """
         from difflib import SequenceMatcher
 
         if self._spaces_cache is None:
@@ -125,31 +131,56 @@ class MyMindGateway:
 
         proposed_norm = space_name.lower().strip()
 
-        # Exact match first
         for s in self._spaces_cache:
             if s["name"].lower().strip() == proposed_norm:
-                return s["id"]
+                return s["id"], False
 
-        # Containment: "Tech" matches "Technology", "Career" matches "Career Development"
         for s in self._spaces_cache:
             existing_norm = s["name"].lower().strip()
             if proposed_norm in existing_norm or existing_norm in proposed_norm:
                 logger.info("Substring matched '%s' -> '%s'", space_name, s["name"])
-                return s["id"]
+                return s["id"], False
 
-        # Fuzzy match (>80% similarity)
         for s in self._spaces_cache:
             ratio = SequenceMatcher(None, proposed_norm, s["name"].lower().strip()).ratio()
             if ratio > 0.80:
                 logger.info("Fuzzy matched '%s' -> '%s' (%.0f%%)", space_name, s["name"], ratio * 100)
-                return s["id"]
+                return s["id"], False
+
+        if not create_if_missing:
+            return None, False
 
         new_space = await self.create_space(space_name)
         if not new_space.get("id"):
             logger.warning("Failed to create space '%s'", space_name)
-            return None
+            return None, False
         self._spaces_cache.append(new_space)
-        return new_space["id"]
+        return new_space["id"], True
+
+    async def resolve_space(self, name: str) -> tuple[str | None, bool]:
+        """Public wrapper. Returns (space_id, created)."""
+        self._ensure_client()
+        return await self._resolve_space_id(name, create_if_missing=True)
+
+    async def assign_to_space(self, card_id: str, space_id: str) -> bool:
+        """Assign a card to a space via PUT /spaces/{space_id}/objects/{card_id}.
+
+        Returns True on success, False on any non-fatal failure.
+        """
+        if not card_id or not space_id:
+            return False
+        self._ensure_client()
+        try:
+            await self._run_sync(
+                self._client._request, "PUT", f"/spaces/{space_id}/objects/{card_id}",
+                headers=self._client._headers_json(),
+            )
+            return True
+        except AuthError:
+            raise
+        except Exception as e:
+            logger.warning("assign_to_space failed: %s", e)
+            return False
 
     async def post_verbatim_note(self, card_id: str, note_text: str) -> bool:
         """Post a user note to mymind's Mind Notes section. Returns True on success."""
@@ -184,15 +215,13 @@ class MyMindGateway:
         if title:
             await self._run_sync(self._client.update_object, card_id, {"title": title})
 
+        space_assigned = False
         if space:
-            space_id = await self._resolve_space_id(space)
+            space_id, _ = await self._resolve_space_id(space)
             if space_id:
-                await self._run_sync(
-                    self._client._request, "PUT", f"/spaces/{space_id}/objects/{card_id}",
-                    headers=self._client._headers_json(),
-                )
+                space_assigned = await self.assign_to_space(card_id, space_id)
 
-        return SavedCard(
+        card = SavedCard(
             mymind_id=card_id,
             title=title,
             category=space,
@@ -201,6 +230,8 @@ class MyMindGateway:
             source_url=url,
             saved_at=datetime.now(timezone.utc),
         )
+        card._space_assigned = space_assigned if space else None
+        return card
 
     async def save_note(
         self, text: str, title: str, tags: list[str], space: str
@@ -212,15 +243,13 @@ class MyMindGateway:
         )
         card_id = result.get("id", "")
 
+        space_assigned = False
         if space:
-            space_id = await self._resolve_space_id(space)
+            space_id, _ = await self._resolve_space_id(space)
             if space_id:
-                await self._run_sync(
-                    self._client._request, "PUT", f"/spaces/{space_id}/objects/{card_id}",
-                    headers=self._client._headers_json(),
-                )
+                space_assigned = await self.assign_to_space(card_id, space_id)
 
-        return SavedCard(
+        card = SavedCard(
             mymind_id=card_id,
             title=title,
             category=space,
@@ -229,6 +258,8 @@ class MyMindGateway:
             source_url=None,
             saved_at=datetime.now(timezone.utc),
         )
+        card._space_assigned = space_assigned if space else None
+        return card
 
     async def save_image(
         self, image_bytes: bytes, mime: str, title: str, tags: list[str], space: str, note: str
@@ -256,15 +287,13 @@ class MyMindGateway:
             for tag in tags:
                 await self._run_sync(self._client.add_tag, card_id, tag)
 
+        space_assigned = False
         if space:
-            space_id = await self._resolve_space_id(space)
+            space_id, _ = await self._resolve_space_id(space)
             if space_id:
-                await self._run_sync(
-                    self._client._request, "PUT", f"/spaces/{space_id}/objects/{card_id}",
-                    headers=self._client._headers_json(),
-                )
+                space_assigned = await self.assign_to_space(card_id, space_id)
 
-        return SavedCard(
+        card = SavedCard(
             mymind_id=card_id,
             title=title,
             category=space,
@@ -273,11 +302,20 @@ class MyMindGateway:
             source_url=None,
             saved_at=datetime.now(timezone.utc),
         )
+        card._space_assigned = space_assigned if space else None
+        return card
 
     async def get_spaces(self) -> list[dict]:
         self._ensure_client()
         spaces = await self._run_sync(self._client.get_spaces)
-        self._spaces_cache = [{"id": s["id"], "name": s["name"]} for s in spaces]
+        self._spaces_cache = [
+            {
+                "id": s["id"],
+                "name": s["name"],
+                "card_count": s.get("card_count", 0),
+            }
+            for s in spaces
+        ]
         return self._spaces_cache
 
     async def get_tags(self) -> list[str]:
@@ -292,6 +330,67 @@ class MyMindGateway:
 
     async def create_tag(self, name: str) -> str:
         return name
+
+    async def get_space_cards(self, space_id: str) -> list[dict]:
+        """List all cards in a space."""
+        self._ensure_client()
+        return await self._run_sync(self._client.get_space_cards, space_id)
+
+    async def search_cards(
+        self,
+        query: str | None = None,
+        tags: list[str] | None = None,
+        card_type: str | None = None,
+        domain: str | None = None,
+        limit: int = 25,
+    ) -> list[dict]:
+        """Search cards by query/tags/type/domain. Uses filter_cards when any
+        non-text filter is set, else falls back to server-side text search."""
+        self._ensure_client()
+
+        def _serialize(card) -> dict:
+            return {
+                "id": card.slug,
+                "title": card.title,
+                "type": card.card_type,
+                "description": card.description,
+                "tags": card.tags,
+                "source_url": card.source_url,
+                "created": getattr(card, "created", ""),
+                "modified": getattr(card, "modified", ""),
+            }
+
+        if tags or domain or card_type:
+            cards = await self._run_sync(
+                self._client.filter_cards,
+                tags=tags,
+                domain=domain,
+                card_type=card_type,
+                text=query,
+                limit=limit,
+            )
+            return [_serialize(c) for c in cards]
+
+        if query:
+            results = await self._run_sync(self._client.search, query)
+            match_ids = {m["id"] for m in results.get("matches", [])}
+            cards = await self._run_sync(self._client.get_all_cards)
+            matched = [c for c in cards if c.slug in match_ids][:limit]
+            return [_serialize(c) for c in matched]
+
+        cards = await self._run_sync(self._client.get_all_cards)
+        return [_serialize(c) for c in cards[:limit]]
+
+    async def delete_card(self, card_id: str) -> bool:
+        self._ensure_client()
+        try:
+            await self._run_sync(self._client.delete_card, card_id)
+            return True
+        except AuthError:
+            raise
+        except Exception as e:
+            logger.warning("delete_card failed: %s", e)
+            return False
 
     async def close(self) -> None:
         pass

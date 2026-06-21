@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import functools
+import re
 
 from stash.models import CategoryResult, ContentPacket
 from stash.security import sanitize_for_prompt
@@ -67,6 +68,62 @@ CLAUDE_KEYWORDS = [
 ]
 
 
+# Patterns that capture an explicit space directive in the user's note.
+# Examples that match (case-insensitive):
+#   "put this in Claude"
+#   "save to LinkedIn"
+#   "add to Career Development"
+#   "-> Tech"  /  "=> Tech"
+#   "in:LinkedIn"
+#   "space: Claude"
+_DIRECTIVE_PATTERNS = [
+    re.compile(
+        r"\b(?:put|save|add|move|stash|drop)\s+(?:this|it)?\s*"
+        r"(?:in(?:to)?|to|under)\s+(?:the\s+)?"
+        r"(?:space\s+called\s+|space\s+|the\s+)?"
+        r"['\"]?(?P<name>[A-Za-z0-9 _\-&/+]+?)['\"]?"
+        r"\s*(?:space|category|collection)?\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(r"^(?:->|=>)\s*['\"]?(?P<name>[A-Za-z0-9 _\-&/+]+?)['\"]?\s*$"),
+    re.compile(r"\b(?:in|to|space|category)\s*[:=]\s*['\"]?(?P<name>[A-Za-z0-9 _\-&/+]+?)['\"]?\s*$", re.IGNORECASE),
+]
+
+_DIRECTIVE_STOP_WORDS = {
+    "this", "it", "that", "here", "there", "today", "tomorrow", "now",
+    "later", "please", "asap", "please.", "the",
+}
+
+
+def parse_space_directive(text: str | None) -> str | None:
+    """Extract an explicit target space name from a user note, or None.
+
+    Conservative: only fires when the phrase clearly names a destination
+    space. Returns the cleaned-up space name (preserving the user's casing
+    where possible).
+    """
+    if not text:
+        return None
+    candidate = text.strip()
+    if not candidate:
+        return None
+
+    for pattern in _DIRECTIVE_PATTERNS:
+        m = pattern.search(candidate)
+        if not m:
+            continue
+        name = (m.group("name") or "").strip(" .,;:!?\"'")
+        if not name:
+            continue
+        if name.lower() in _DIRECTIVE_STOP_WORDS:
+            continue
+        # Reject obvious non-names (too long => probably a sentence)
+        if len(name) > 60 or len(name.split()) > 5:
+            continue
+        return name
+    return None
+
+
 def _is_claude_content(packet: ContentPacket) -> bool:
     text = " ".join(filter(None, [
         packet.transcript,
@@ -79,6 +136,15 @@ def _is_claude_content(packet: ContentPacket) -> bool:
 
 async def categorize(packet: ContentPacket, taxonomy: TaxonomyCache) -> CategoryResult:
     await taxonomy.refresh_if_stale()
+
+    # Precedence:
+    # 1. Explicit user directive in the same message ("put this in X") wins.
+    # 2. Else Claude keyword path -> dedicated "Claude" space.
+    # 3. Else general Gemini inference against the existing taxonomy.
+    directive_space = parse_space_directive(packet.user_note)
+
+    if directive_space:
+        return await _categorize_with_forced_space(packet, directive_space)
 
     if _is_claude_content(packet):
         return await _categorize_claude(packet, taxonomy)
@@ -104,6 +170,50 @@ async def categorize(packet: ContentPacket, taxonomy: TaxonomyCache) -> Category
     result = _parse_result(result_json)
     result.verbatim_note = packet.user_note
     return result
+
+
+async def _categorize_with_forced_space(
+    packet: ContentPacket, forced_space: str
+) -> CategoryResult:
+    """User explicitly named a target space. Force category and still let
+    Gemini generate a good title/summary/tags. The save layer is responsible
+    for creating the space if it doesn't exist."""
+    transcript_block = ""
+    if packet.transcript:
+        transcript_block = f"Transcript: {sanitize_for_prompt(packet.transcript)[:500]}\n"
+    user_note_block = ""
+    if packet.user_note:
+        user_note_block = f"User note: {sanitize_for_prompt(packet.user_note)}\n"
+
+    prompt = TITLE_SUMMARY_PROMPT.format(
+        content_type=packet.content_type.value,
+        transcript_block=transcript_block,
+        user_note_block=user_note_block,
+    )
+
+    title = packet.user_note[:60] if packet.user_note else (packet.raw_input[:60] or "Untitled")
+    summary = packet.user_note or (packet.raw_input[:120] if packet.raw_input else "")
+    try:
+        result_json = await asyncio.wait_for(
+            _call_gemini(PRIMARY_MODEL, prompt, None),
+            timeout=LATENCY_THRESHOLD,
+        )
+        data = json.loads(result_json.strip())
+        title = data.get("title", title) or title
+        summary = data.get("summary", summary) or summary
+    except Exception as e:
+        logger.warning("Title/summary gen failed for forced space, using fallback: %s", e)
+
+    return CategoryResult(
+        title=title,
+        category=forced_space,
+        tags=[],
+        summary=summary,
+        is_new_category=True,  # save layer resolves: existing -> no-op, missing -> create
+        confidence=1.0,
+        reasoning=f"Explicit user directive to space '{forced_space}'",
+        verbatim_note=packet.user_note,
+    )
 
 
 async def _categorize_claude(packet: ContentPacket, taxonomy: TaxonomyCache) -> CategoryResult:

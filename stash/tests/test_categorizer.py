@@ -3,7 +3,13 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from stash.categorizer import _build_user_prompt, _is_claude_content, _parse_result, categorize
+from stash.categorizer import (
+    _build_user_prompt,
+    _is_claude_content,
+    _parse_result,
+    categorize,
+    parse_space_directive,
+)
 from stash.gateway.sandbox import SandboxGateway
 from stash.models import CategoryResult, ContentPacket, ContentType
 from stash.taxonomy import TaxonomyCache
@@ -193,3 +199,109 @@ class TestClaudeDetection:
             assert result.confidence == 1.0
             assert "claude" in result.tags
             assert result.is_new_category is True
+
+
+class TestParseSpaceDirective:
+    def test_put_this_in(self):
+        assert parse_space_directive("put this in the Claude") == "Claude"
+
+    def test_save_to(self):
+        assert parse_space_directive("save to LinkedIn") == "LinkedIn"
+
+    def test_add_to(self):
+        assert parse_space_directive("add to Career Development") == "Career Development"
+
+    def test_arrow(self):
+        assert parse_space_directive("-> Tech") == "Tech"
+
+    def test_in_colon(self):
+        assert parse_space_directive("in: LinkedIn") == "LinkedIn"
+
+    def test_space_called(self):
+        assert parse_space_directive("put this in the space called Reels") == "Reels"
+
+    def test_no_directive_returns_none(self):
+        assert parse_space_directive("great tutorial on async") is None
+        assert parse_space_directive("just a note") is None
+
+    def test_empty(self):
+        assert parse_space_directive("") is None
+        assert parse_space_directive(None) is None
+
+    def test_stop_word_rejected(self):
+        assert parse_space_directive("put this in this") is None
+        assert parse_space_directive("save it to it") is None
+
+    def test_too_long_rejected(self):
+        long_phrase = "save to " + "word " * 10
+        assert parse_space_directive(long_phrase) is None
+
+
+class TestCategorizeWithDirective:
+    @pytest.mark.asyncio
+    async def test_directive_overrides_claude_keyword(self, taxonomy):
+        # Message mentions Claude (would normally route to Claude path)
+        # but the user explicitly says "put this in LinkedIn".
+        pkt = ContentPacket(
+            content_type=ContentType.REEL_URL,
+            raw_input="https://instagram.com/reel/x",
+            source_url="https://instagram.com/reel/x",
+            transcript="Discussion about Claude Code productivity.",
+            user_note="put this in LinkedIn",
+        )
+
+        mock_response = '{"title": "Productivity Tips", "summary": "Tips for using Claude productively."}'
+
+        with patch("stash.categorizer._call_gemini", new=AsyncMock(return_value=mock_response)):
+            result = await categorize(pkt, taxonomy)
+
+        assert result.category == "LinkedIn"
+        assert result.is_new_category is True
+        assert result.confidence == 1.0
+        assert "LinkedIn" in (result.reasoning or "")
+
+    @pytest.mark.asyncio
+    async def test_directive_uses_gemini_for_title(self, taxonomy):
+        pkt = ContentPacket(
+            content_type=ContentType.UNKNOWN_URL,
+            raw_input="https://example.com",
+            source_url="https://example.com",
+            user_note="save to Tech",
+        )
+
+        mock_response = '{"title": "Cool Article", "summary": "An overview."}'
+
+        with patch("stash.categorizer._call_gemini", new=AsyncMock(return_value=mock_response)):
+            result = await categorize(pkt, taxonomy)
+
+        assert result.category == "Tech"
+        assert result.title == "Cool Article"
+        assert result.summary == "An overview."
+
+    @pytest.mark.asyncio
+    async def test_directive_survives_gemini_failure(self, taxonomy):
+        pkt = ContentPacket(
+            content_type=ContentType.TEXT,
+            raw_input="some text",
+            user_note="put this in Reels",
+        )
+
+        with patch("stash.categorizer._call_gemini", new=AsyncMock(side_effect=RuntimeError("down"))):
+            result = await categorize(pkt, taxonomy)
+
+        assert result.category == "Reels"
+        assert result.confidence == 1.0
+
+    @pytest.mark.asyncio
+    async def test_no_directive_still_routes_to_claude(self, taxonomy):
+        # Claude keyword present, no directive — original behavior preserved.
+        pkt = ContentPacket(
+            content_type=ContentType.YOUTUBE_URL,
+            raw_input="https://youtube.com/watch?v=x",
+            transcript="Building an MCP server with Claude.",
+            user_note="great tutorial",
+        )
+        mock_response = '{"title": "MCP Tutorial", "summary": "How to build an MCP server."}'
+        with patch("stash.categorizer._call_gemini", new=AsyncMock(return_value=mock_response)):
+            result = await categorize(pkt, taxonomy)
+        assert result.category == "Claude"
