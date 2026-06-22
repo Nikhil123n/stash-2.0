@@ -3,6 +3,12 @@
 **For:** Claude Code  
 **Purpose:** Build the complete backend for the Stash Discord bot
 
+**Current documentation note:** This file began as the v1.0 build spec and
+still preserves the original capture-pipeline documentation where it remains
+valid. The live code is now v2.1.1 and includes a second plain-text agent
+path for mymind library management. Current behavior and corrections are
+called out below rather than removing legacy context.
+
 ---
 
 ## 0. What is Stash?
@@ -38,6 +44,53 @@ Discord Reply       ← confirms save with card details; asks for clarification 
 ```
 
 Everything is async Python (`asyncio`). No web server needed. The bot process IS the server.
+
+### Current v2.1.1 Architecture Addendum
+
+The implemented system now has two message paths:
+
+```text
+Discord message
+  -> route_message()
+  -> capture pipeline for URLs/attachments
+  -> agent pipeline for plain text
+```
+
+Capture pipeline:
+
+```text
+Extractor -> ContentPacket -> Categorizer -> MindGateway -> Discord reply
+```
+
+Agent pipeline:
+
+```text
+Prefix command or Gemini function call -> Tool registry -> MindGateway -> Discord reply
+```
+
+New modules added after the original spec:
+
+- `agent.py`: Gemini function-calling orchestrator for text-only messages.
+- `tools.py`: gateway-backed tools for list/search/create/save/move/delete/stats/recent/random.
+- `commands.py`: `/help`, `/model`, and `/stats`.
+- `settings.py`: persisted agent model preference.
+- `help.py`: Discord help text and startup greeting.
+
+### Today's Commit Review
+
+No commits exist in the June 22, 2026 window for this checkout. The active
+local "today" history is June 21, 2026:
+
+- `ca6dedb`: added the Gemini agent layer, tool registry, runtime model
+  settings, prefix commands, gateway extension methods, and tests.
+- `6e8a404`: merged the feature branch into `main`.
+- `2c4cf11`: fixed natural-language space directives with intervening nouns
+  and exposed card IDs in all card-facing replies.
+
+Compared with `6ec9aa4`, Stash moved from a capture-only bot to a capture
+and library-management assistant. The main review risks are ambiguous
+plain-text intent, advertised-but-not-implemented agent fallback retry, and
+the expanded unofficial mymind integration surface.
 
 ---
 
@@ -117,6 +170,7 @@ class CategoryResult:
     is_new_category: bool
     confidence: float               # 0.0–1.0
     reasoning: str | None           # Gemini's self-explanation (debug only, not stored)
+    verbatim_note: str | None       # optional current-code user note for Mind Notes
 ```
 
 ### SavedCard
@@ -149,6 +203,12 @@ Logic:
   - Anything else with http/https → `UNKNOWN_URL`
 - If message is plain text with no URL and no attachment → `TEXT`
 - If message has both a URL and extra text after the URL, the extra text is `user_note`
+
+Current implementation additions:
+- Discord mentions are stripped before routing.
+- `[[...]]` annotations are extracted and become `user_note`.
+- Text-only messages are classified as `TEXT`, but `bot.py` routes them to
+  the agent path before the extractor/categorizer capture path.
 
 ### 4.2 Extractor (`extractor/`)
 
@@ -220,9 +280,15 @@ Lifecycle:
 Receives `ContentPacket` + `TaxonomyCache`. Returns `CategoryResult`.
 
 #### Model selection
-- Primary: **Vertex AI Gemini 2.5 Pro** (for images and long transcripts)
-- Fallback: **Vertex AI Gemini 2.5 Flash** (if Pro quota exceeded or latency > 10s)
+- Current categorizer primary: **Vertex AI Gemini 2.5 Flash**
+- Current categorizer fallback: **Vertex AI Gemini 2.5 Pro**
+- Current categorizer timeout before fallback: **30 seconds**
 - Use `google-cloud-aiplatform` SDK directly — NOT OpenRouter (Vertex credits only work via Vertex SDK)
+
+Agent model selection is separate. `/model flash` and `/model pro` change
+the plain-text agent model. The agent UI reports a fallback model, but
+`stash.agent.handle_text()` currently does not retry with that fallback after
+timeout or exception.
 
 #### Prompt structure
 
@@ -282,16 +348,24 @@ class MindGateway(Protocol):
     async def get_spaces(self) -> list[dict]: ...
     async def get_tags(self) -> list[str]: ...
     async def create_space(self, name: str) -> dict: ...
+    async def create_tag(self, name: str) -> str: ...
+    async def get_space_cards(self, space_id: str) -> list[dict]: ...
+    async def search_cards(self, query: str | None = None, tags: list[str] | None = None, card_type: str | None = None, domain: str | None = None, limit: int = 25) -> list[dict]: ...
+    async def assign_to_space(self, card_id: str, space_id: str) -> bool: ...
+    async def delete_card(self, card_id: str) -> bool: ...
+    async def resolve_space(self, name: str) -> tuple[str | None, bool]: ...
 ```
 
 #### mymind.py — MyMindGateway
 Wraps `iamumeransari/mymind-api` Python client.
 
 Key behaviors:
-- Credentials (`MYMIND_EMAIL`, `MYMIND_PASSWORD` or session tokens) loaded from env, never hardcoded
-- Token stored only in memory (never written to disk in production)
-- Auto-retry on 401: attempt token refresh once, then raise `AuthError`
-- Rate limiting: add `asyncio.sleep(0.5)` between consecutive mymind calls to avoid triggering their internal limits (they are undocumented but empirically ~2 req/sec is safe)
+- Current credentials are cookie-based: `MYMIND_JWT`, `MYMIND_CID`, and `MYMIND_AUTHENTICITY_TOKEN`
+- Local production runs can load cookies from the Windows keyring service `mymind-api`
+- Railway production uses cookies exported by `scripts/export_cookies.py`
+- Auth failures set `_auth_failed` and raise `AuthError`; the bot asks for re-auth and redeploy
+- Space assignment is a separate `PUT /spaces/{space_id}/objects/{card_id}` call
+- Image upload and Mind Notes use direct HTTPS calls to `access.mymind.com`
 - All responses parsed into internal dataclasses — raw mymind JSON never leaks out of this module
 
 #### sandbox.py — SandboxGateway
@@ -321,7 +395,8 @@ Key behaviors:
 This section is non-negotiable. The mymind API is unofficial and reverse-engineered. The attack surface is: credentials leaking, user content leaking to logs, and malicious content in Discord messages being injected into AI prompts.
 
 ### 5.1 Credential Handling
-- All secrets in `.env` only: `DISCORD_TOKEN`, `MYMIND_KID`, `MYMIND_SECRET`, `GOOGLE_APPLICATION_CREDENTIALS`, `GROQ_API_KEY`
+- All secrets in `.env` or deployment environment only: `DISCORD_TOKEN`, `GOOGLE_APPLICATION_CREDENTIALS`, `GROQ_API_KEY`, `MYMIND_JWT`, `MYMIND_CID`, `MYMIND_AUTHENTICITY_TOKEN`
+- `MYMIND_KID` and `MYMIND_SECRET` are older assumptions and are not read by the current code
 - `.env` is in `.gitignore` — committed `.env.example` has only key names, no values
 - Secrets never logged at any log level, including `DEBUG`
 - `config.py` validates all required env vars at startup and raises `ConfigError` immediately if any are missing — no silent fallbacks
@@ -372,7 +447,7 @@ def create_gateway(config) -> MindGateway:
     if config.ENV == "sandbox":
         return SandboxGateway(config.SANDBOX_FILE)
     elif config.ENV == "production":
-        return MyMindGateway(config)
+        return MyMindGateway()
     else:
         raise ConfigError(f"Unknown STASH_ENV: {config.ENV}")
 ```
@@ -415,6 +490,7 @@ pytest-asyncio>=0.23.0
 System dependencies (installed in Dockerfile):
 ```
 ffmpeg
+git
 ```
 
 ---
@@ -424,13 +500,13 @@ ffmpeg
 ### Dockerfile
 ```dockerfile
 FROM python:3.12-slim
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ffmpeg git && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 RUN mkdir -p /tmp/stash
-CMD ["python", "bot.py"]
+CMD ["python", "-m", "stash.bot"]
 ```
 
 ### Environment variables (`.env.example`)
@@ -438,12 +514,15 @@ CMD ["python", "bot.py"]
 DISCORD_TOKEN=
 STASH_OWNER_ID=             # your Discord user ID (integer)
 STASH_ENV=sandbox           # "sandbox" or "production"
-MYMIND_KID=                 # from access.mymind.com/extensions
-MYMIND_SECRET=              # from access.mymind.com/extensions
 GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-key.json
+GCP_PROJECT_ID=
+GCP_LOCATION=us-central1
 GROQ_API_KEY=
 SANDBOX_FILE=./sandbox_data.json
 FFMPEG_LOCATION=         # optional: path to ffmpeg/ffprobe binaries if not on PATH
+MYMIND_JWT=
+MYMIND_CID=
+MYMIND_AUTHENTICITY_TOKEN=
 ```
 
 ### Deploy target
@@ -472,6 +551,11 @@ Build in this sequence. Each step should be independently runnable/testable befo
 13. Tests for each module
 14. `Dockerfile` + `README.md`
 
+Current v2.1.1 additions after the original build order:
+15. `agent.py` + `tools.py`
+16. `commands.py` + `settings.py` + `help.py`
+17. Extended gateway methods and tests for agent workflows
+
 ---
 
 ## 10. What NOT to Build
@@ -487,10 +571,10 @@ Build in this sequence. Each step should be independently runnable/testable befo
 
 ## 11. Open Questions (Decide Before Building)
 
-1. **mymind image upload:** The `iamumeransari/mymind-api` client supports `save_url` and `create_note`. Confirm it supports uploading raw image bytes before implementing `gateway/mymind.py`. If not, save images as notes with a base64 embed or skip image upload to mymind (just categorize and save metadata).
+1. **mymind image upload:** Resolved in current code via direct `POST https://access.mymind.com/objects` from `MyMindGateway.save_image()`.
 
 2. **Instagram/TikTok yt-dlp reliability:** Test locally before assuming it works. If yt-dlp fails consistently on reels, the fallback (ask user for a note) becomes the primary flow for that content type. Document which platforms work.
 
 3. **Vertex AI service account:** You need a GCP project with Vertex AI API enabled and a service account with `roles/aiplatform.user`. Create this before running the bot.
 
-4. **mymind token refresh:** The `iamumeransari/mymind-api` client stores tokens in system keychain on desktop. In a containerized deployment, this won't work. Investigate whether `MYMIND_KID` + `MYMIND_SECRET` from `access.mymind.com/extensions` are long-lived static keys (the `nawwal/mymind-mcp` approach) or short-lived OAuth tokens. If they're static, use them directly. If they expire, you need a headless re-auth flow.
+4. **mymind token refresh:** Current production path exports cookies from Windows keyring via `scripts/export_cookies.py` and stores `MYMIND_JWT`, `MYMIND_CID`, and `MYMIND_AUTHENTICITY_TOKEN` in Railway. When cookies expire, re-export and redeploy.
