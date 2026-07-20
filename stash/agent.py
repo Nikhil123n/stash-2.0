@@ -302,7 +302,7 @@ async def handle_text(
     except asyncio.TimeoutError:
         return AgentResult(error="Agent timed out.", text="Took too long — try again?")
     except Exception as e:
-        logger.exception("Agent call failed")
+        logger.exception("Agent call failed: %s: %s", type(e).__name__, str(e)[:250])
         return AgentResult(error=str(e), text="Something went sideways. Try again?")
 
     fc = response.get("function_call")
