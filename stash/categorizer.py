@@ -13,7 +13,11 @@ from stash.taxonomy import TaxonomyCache
 logger = logging.getLogger(__name__)
 
 PRIMARY_MODEL = "gemini-2.5-flash"
-FALLBACK_MODEL = "gemini-2.5-pro"
+# Fallback chain crosses providers so one outage can't take down every rung:
+# Vertex AI -> Groq -> OpenRouter. Both fallback models are free-tier and
+# picked for strong instruction-following/JSON output.
+FALLBACK_MODEL = "llama-3.3-70b-versatile"  # Groq
+FALLBACK_MODEL_2 = "qwen/qwen-2.5-72b-instruct:free"  # OpenRouter
 LATENCY_THRESHOLD = 30.0
 
 SYSTEM_PROMPT = (
@@ -183,10 +187,16 @@ async def categorize(packet: ContentPacket, taxonomy: TaxonomyCache) -> Category
     except (asyncio.TimeoutError, Exception) as e:
         logger.warning("Primary model failed (%s), falling back to %s", e, FALLBACK_MODEL)
         try:
-            result_json = await _call_gemini(FALLBACK_MODEL, user_prompt, image_data)
-        except Exception as fallback_err:
-            logger.error("Fallback model also failed: %s", fallback_err)
-            raise
+            result_json = await _call_groq(FALLBACK_MODEL, user_prompt)
+        except Exception as groq_err:
+            logger.warning(
+                "Groq fallback failed (%s), falling back to %s", groq_err, FALLBACK_MODEL_2
+            )
+            try:
+                result_json = await _call_openrouter(FALLBACK_MODEL_2, user_prompt)
+            except Exception as openrouter_err:
+                logger.error("All fallback models failed: %s", openrouter_err)
+                raise
 
     result = _parse_result(result_json)
     result.verbatim_note = packet.user_note
@@ -357,6 +367,47 @@ async def _call_gemini(
         return response.text
 
     return await loop.run_in_executor(None, _sync_call)
+
+
+async def _call_groq(model_name: str, user_prompt: str) -> str:
+    """Text-only fallback path. Images are dropped here since none of
+    Groq's free-tier models support vision input."""
+    from groq import AsyncGroq
+
+    client = AsyncGroq()
+    response = await client.chat.completions.create(
+        model=model_name,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.3,
+        max_tokens=2048,
+        response_format={"type": "json_object"},
+    )
+    return response.choices[0].message.content
+
+
+async def _call_openrouter(model_name: str, user_prompt: str) -> str:
+    """Text-only second fallback path, via OpenRouter's OpenAI-compatible API."""
+    import os
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=os.environ["OPENROUTER_API_KEY"],
+    )
+    response = await client.chat.completions.create(
+        model=model_name,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.3,
+        max_tokens=2048,
+        response_format={"type": "json_object"},
+    )
+    return response.choices[0].message.content
 
 
 def _parse_result(raw_json: str) -> CategoryResult:

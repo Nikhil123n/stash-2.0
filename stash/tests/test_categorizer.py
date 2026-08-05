@@ -132,24 +132,52 @@ class TestCategorize:
 
     @pytest.mark.asyncio
     async def test_fallback_on_timeout(self, taxonomy):
-        from stash.categorizer import PRIMARY_MODEL, FALLBACK_MODEL
+        from stash.categorizer import FALLBACK_MODEL
 
         pkt = ContentPacket(content_type=ContentType.TEXT, raw_input="test")
         mock_response = '{"title": "Fallback", "category": "Inbox", "tags": [], "summary": "x", "is_new_category": false, "confidence": 0.6, "reasoning": null}'
 
-        call_count = []
+        groq_calls = []
 
-        async def mock_gemini(model, prompt, image_data=None):
-            call_count.append(model)
-            if model == PRIMARY_MODEL:
-                raise asyncio.TimeoutError()
+        async def mock_groq(model, prompt):
+            groq_calls.append(model)
             return mock_response
 
-        with patch("stash.categorizer._call_gemini", side_effect=mock_gemini):
+        with patch("stash.categorizer._call_gemini", new=AsyncMock(side_effect=asyncio.TimeoutError())), \
+             patch("stash.categorizer._call_groq", side_effect=mock_groq):
             result = await categorize(pkt, taxonomy)
             assert result.title == "Fallback"
-            assert PRIMARY_MODEL in call_count
-            assert FALLBACK_MODEL in call_count
+            assert groq_calls == [FALLBACK_MODEL]
+
+    @pytest.mark.asyncio
+    async def test_fallback_to_openrouter_when_groq_also_fails(self, taxonomy):
+        from stash.categorizer import FALLBACK_MODEL_2
+
+        pkt = ContentPacket(content_type=ContentType.TEXT, raw_input="test")
+        mock_response = '{"title": "OpenRouter", "category": "Inbox", "tags": [], "summary": "x", "is_new_category": false, "confidence": 0.5, "reasoning": null}'
+
+        openrouter_calls = []
+
+        async def mock_openrouter(model, prompt):
+            openrouter_calls.append(model)
+            return mock_response
+
+        with patch("stash.categorizer._call_gemini", new=AsyncMock(side_effect=RuntimeError("vertex down"))), \
+             patch("stash.categorizer._call_groq", new=AsyncMock(side_effect=RuntimeError("groq down"))), \
+             patch("stash.categorizer._call_openrouter", side_effect=mock_openrouter):
+            result = await categorize(pkt, taxonomy)
+            assert result.title == "OpenRouter"
+            assert openrouter_calls == [FALLBACK_MODEL_2]
+
+    @pytest.mark.asyncio
+    async def test_all_fallbacks_fail_raises(self, taxonomy):
+        pkt = ContentPacket(content_type=ContentType.TEXT, raw_input="test")
+
+        with patch("stash.categorizer._call_gemini", new=AsyncMock(side_effect=RuntimeError("vertex down"))), \
+             patch("stash.categorizer._call_groq", new=AsyncMock(side_effect=RuntimeError("groq down"))), \
+             patch("stash.categorizer._call_openrouter", new=AsyncMock(side_effect=RuntimeError("openrouter down"))):
+            with pytest.raises(RuntimeError, match="openrouter down"):
+                await categorize(pkt, taxonomy)
 
 
 class TestClaudeDetection:
