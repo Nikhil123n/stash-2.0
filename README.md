@@ -8,7 +8,7 @@ categorization, and agentic library-management workflows.
 
 It still captures content (links, screenshots, voice notes,
 YouTube/reel URLs) and saves categorized cards in [mymind](https://mymind.com).
-As of v2.1.1, plain-text Discord messages can also manage the library through
+As of v2.2.0, plain-text Discord messages can also manage the library through
 a Gemini function-calling agent.
 
 ## How it works
@@ -53,9 +53,17 @@ cp .env.example .env
 | `DISCORD_TOKEN` | [Discord Developer Portal](https://discord.com/developers/applications) |
 | `STASH_OWNER_ID` | Your Discord user ID (enable Developer Mode, right-click yourself) |
 | `GOOGLE_APPLICATION_CREDENTIALS` | GCP service account JSON with Vertex AI access |
-| `GROQ_API_KEY` | [Groq Console](https://console.groq.com) |
+| `GROQ_API_KEY` | [Groq Console](https://console.groq.com) — categorizer fallback tier 2 |
+| `OPENROUTER_API_KEY` | [OpenRouter dashboard](https://openrouter.ai/keys) — categorizer fallback tier 3 |
 
-Production mymind auth is cookie-based in the current code:
+### mymind auth — two schemes, only one active
+
+`main` uses **cookie-based** auth exclusively. A separate, unmaintained
+**JWT-key-based** scheme exists only on the archived `approach/jwt` branch.
+Don't mix the two — `stash.config`/`stash.gateway.mymind` on `main` only ever
+read the cookie-based set below.
+
+**Cookie-based (active on `main`)**
 
 | Variable | Source |
 |----------|--------|
@@ -63,8 +71,12 @@ Production mymind auth is cookie-based in the current code:
 | `MYMIND_CID` | Exported by `python scripts/export_cookies.py` |
 | `MYMIND_AUTHENTICITY_TOKEN` | Exported by `python scripts/export_cookies.py` |
 
-`MYMIND_KID` and `MYMIND_SECRET` are older setup assumptions and are not read
-by `stash.config` or `stash.gateway.mymind`.
+**JWT-key-based (`approach/jwt` branch only — not read by `main`)**
+
+| Variable | Source |
+|----------|--------|
+| `MYMIND_KID` | mymind API key ID (that branch's own setup flow) |
+| `MYMIND_SECRET` | mymind API key secret (that branch's own setup flow) |
 
 ### Optional settings
 
@@ -93,7 +105,38 @@ docker build -t stash .
 docker run --env-file .env stash
 ```
 
-### Deploy to Railway (zero mymind credits)
+### Deploy to Northflank (current)
+
+The `Dockerfile` is the build target — no code changes needed versus any
+other host.
+
+1. Run locally first to authenticate with mymind:
+   ```bash
+   mymind login
+   ```
+   Complete the browser login when prompted so cookies are available in the
+   local keyring.
+
+2. Export cookies:
+   ```bash
+   python scripts/export_cookies.py
+   ```
+
+3. Connect this GitHub repo in the Northflank dashboard and create a service
+   from it (Dockerfile build). Add the three cookie-based `MYMIND_*` values
+   plus the other required vars (see tables above) under that service's
+   environment variables.
+
+4. Deploy. Bot runs with zero mymind API credits.
+
+5. When bot DMs you "needs re-auth":
+   Repeat steps 1-2, update the Northflank env vars, redeploy (~2 minutes).
+
+<details>
+<summary>Archived: Railway deployment (used until Aug 2026)</summary>
+
+Railway's free trial ran out, so production moved to Northflank. These steps
+are kept for reference only — do not use them for new deploys.
 
 1. Run locally first to authenticate with mymind:
    ```bash
@@ -115,13 +158,15 @@ docker run --env-file .env stash
 5. When bot DMs you "needs re-auth":
    Repeat steps 1-3, update Railway vars, redeploy (~2 minutes).
 
+</details>
+
 ## Testing
 
 ```bash
 python -m pytest -q
 ```
 
-Current local verification for the June 21 codebase: `172 passed`.
+Current local verification: `174 passed`.
 
 ## Architecture
 
@@ -132,7 +177,9 @@ Discord message -> InputRouter -> Extractor -> Categorizer -> Gateway -> mymind
 
 - **InputRouter**: Classifies messages by content type
 - **Extractors**: video (yt-dlp + Whisper), audio (Whisper), image (passthrough)
-- **Categorizer**: Gemini 2.5 Flash with Pro fallback and taxonomy-aware prompting
+- **Categorizer**: Gemini 2.5 Flash, falling back to Groq Llama 3.3 70B then
+  OpenRouter Qwen 2.5 72B (free tier) so no single provider outage breaks
+  categorization; taxonomy-aware prompting
 - **Gateway**: mymind API wrapper (production) or local JSON (sandbox)
 - **Agent**: Gemini function-calling layer for text-only library-management messages
 - **Tools**: Gateway-backed actions for list/search/create/save/move/delete/stats/recent/random
@@ -169,9 +216,14 @@ path, then general Gemini inference.
   the agent selects the `save_note` tool.
 - The agent UI reports a fallback model, but `stash.agent.handle_text` does
   not currently retry with that fallback after timeout or exception.
-- The categorizer path does implement Flash -> Pro fallback.
+- The categorizer path implements a 3-tier cross-provider fallback:
+  Gemini 2.5 Flash -> Groq Llama 3.3 70B -> OpenRouter Qwen 2.5 72B.
 - The production gateway uses unofficial mymind internals and cookie auth.
 - `mymind-api` is installed from upstream `main`, so rebuilds can change
   behavior without a Stash commit.
 - Runtime agent settings are stored in `stash_settings.json`; in production
   the file lives under `TMP_DIR`, which may not persist across restarts.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -18,6 +18,7 @@ PRIMARY_MODEL = "gemini-2.5-flash"
 # picked for strong instruction-following/JSON output.
 FALLBACK_MODEL = "llama-3.3-70b-versatile"  # Groq
 FALLBACK_MODEL_2 = "qwen/qwen-2.5-72b-instruct:free"  # OpenRouter
+MODEL_CHAIN = [PRIMARY_MODEL, FALLBACK_MODEL, FALLBACK_MODEL_2]
 LATENCY_THRESHOLD = 30.0
 
 SYSTEM_PROMPT = (

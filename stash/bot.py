@@ -10,8 +10,7 @@ import discord
 
 from stash.agent import AgentResult, PendingTool, execute_pending, handle_text
 from stash.alerts import DiscordAlertHandler, send_alert
-from stash.categorizer import FALLBACK_MODEL as CAT_FALLBACK
-from stash.categorizer import PRIMARY_MODEL as CAT_PRIMARY
+from stash.categorizer import MODEL_CHAIN as CAT_MODEL_CHAIN
 from stash.categorizer import categorize
 from stash.commands import try_handle as try_command
 from stash.config import load_config, StashConfig
@@ -35,8 +34,8 @@ logger = logging.getLogger("stash")
 
 CONFIDENCE_THRESHOLD = 0.75
 CONFIRMATION_TIMEOUT = 300  # 5 minutes
-GATEWAY_MODE = "cookie-local"  # "jwt-railway" on main branch, "cookie-local" on stable/cookie-local
-VERSION = "2.1.1"
+GATEWAY_MODE = "cookie-local"  # JWT-key auth lives only on the archived approach/jwt branch
+VERSION = "2.2.0"
 SETTINGS_FILE = "stash_settings.json"
 
 
@@ -135,8 +134,7 @@ class StashBot(discord.Client):
             fallback_label=MODEL_LABELS.get(
                 fallback_for(agent_model), fallback_for(agent_model)
             ),
-            categorizer_primary=CAT_PRIMARY,
-            categorizer_fallback=CAT_FALLBACK,
+            categorizer_chain=" -> ".join(CAT_MODEL_CHAIN),
             space_count=len(self._taxonomy.spaces),
             tag_count=len(self._taxonomy.tags),
             tool_count=len(self._tool_registry),

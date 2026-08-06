@@ -59,7 +59,7 @@ STARTUP_GREETING_TEMPLATE = """\
 Gateway: `{gateway_mode}` ({env})
 Agent model: {agent_label}
 Fallback model: {fallback_label}
-Categorizer: {categorizer_primary} -> {categorizer_fallback}
+Categorizer: {categorizer_chain}
 Spaces: {space_count} | Tags: {tag_count} | Tools: {tool_count}
 
 Type `/help` for what you can do.
