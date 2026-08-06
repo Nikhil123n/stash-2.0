@@ -125,59 +125,113 @@ class TestCategorize:
         pkt = ContentPacket(content_type=ContentType.TEXT, raw_input="test note")
         mock_response = '{"title": "Note", "category": "Tech", "tags": ["python"], "summary": "A note.", "is_new_category": false, "confidence": 0.85, "reasoning": "clear"}'
 
-        with patch("stash.categorizer._call_gemini", new=AsyncMock(return_value=mock_response)):
+        with patch("stash.categorizer._call_groq", new=AsyncMock(return_value=mock_response)):
             result = await categorize(pkt, taxonomy)
             assert result.title == "Note"
             assert result.confidence == 0.85
 
     @pytest.mark.asyncio
-    async def test_fallback_on_timeout(self, taxonomy):
+    async def test_fallback_to_openrouter_on_groq_failure(self, taxonomy):
         from stash.categorizer import FALLBACK_MODEL
 
         pkt = ContentPacket(content_type=ContentType.TEXT, raw_input="test")
         mock_response = '{"title": "Fallback", "category": "Inbox", "tags": [], "summary": "x", "is_new_category": false, "confidence": 0.6, "reasoning": null}'
 
-        groq_calls = []
-
-        async def mock_groq(model, prompt):
-            groq_calls.append(model)
-            return mock_response
-
-        with patch("stash.categorizer._call_gemini", new=AsyncMock(side_effect=asyncio.TimeoutError())), \
-             patch("stash.categorizer._call_groq", side_effect=mock_groq):
-            result = await categorize(pkt, taxonomy)
-            assert result.title == "Fallback"
-            assert groq_calls == [FALLBACK_MODEL]
-
-    @pytest.mark.asyncio
-    async def test_fallback_to_openrouter_when_groq_also_fails(self, taxonomy):
-        from stash.categorizer import FALLBACK_MODEL_2
-
-        pkt = ContentPacket(content_type=ContentType.TEXT, raw_input="test")
-        mock_response = '{"title": "OpenRouter", "category": "Inbox", "tags": [], "summary": "x", "is_new_category": false, "confidence": 0.5, "reasoning": null}'
-
         openrouter_calls = []
 
-        async def mock_openrouter(model, prompt):
+        async def mock_groq(model, prompt, image_data=None):
+            raise asyncio.TimeoutError()
+
+        async def mock_openrouter(model, prompt, image_data=None):
             openrouter_calls.append(model)
             return mock_response
 
-        with patch("stash.categorizer._call_gemini", new=AsyncMock(side_effect=RuntimeError("vertex down"))), \
-             patch("stash.categorizer._call_groq", new=AsyncMock(side_effect=RuntimeError("groq down"))), \
+        with patch("stash.categorizer._call_groq", side_effect=mock_groq), \
              patch("stash.categorizer._call_openrouter", side_effect=mock_openrouter):
             result = await categorize(pkt, taxonomy)
-            assert result.title == "OpenRouter"
-            assert openrouter_calls == [FALLBACK_MODEL_2]
+            assert result.title == "Fallback"
+            assert openrouter_calls == [FALLBACK_MODEL]
+
+    @pytest.mark.asyncio
+    async def test_second_groq_fallback_when_openrouter_also_fails(self, taxonomy):
+        from stash.categorizer import FALLBACK_MODEL_2, PRIMARY_MODEL
+
+        pkt = ContentPacket(content_type=ContentType.TEXT, raw_input="test")
+        mock_response = '{"title": "SecondFallback", "category": "Inbox", "tags": [], "summary": "x", "is_new_category": false, "confidence": 0.5, "reasoning": null}'
+
+        groq_calls = []
+
+        async def mock_groq(model, prompt, image_data=None):
+            groq_calls.append(model)
+            if model == PRIMARY_MODEL:
+                raise RuntimeError("groq primary down")
+            return mock_response
+
+        with patch("stash.categorizer._call_groq", side_effect=mock_groq), \
+             patch("stash.categorizer._call_openrouter", new=AsyncMock(side_effect=RuntimeError("openrouter down"))):
+            result = await categorize(pkt, taxonomy)
+            assert result.title == "SecondFallback"
+            assert groq_calls == [PRIMARY_MODEL, FALLBACK_MODEL_2]
 
     @pytest.mark.asyncio
     async def test_all_fallbacks_fail_raises(self, taxonomy):
         pkt = ContentPacket(content_type=ContentType.TEXT, raw_input="test")
 
-        with patch("stash.categorizer._call_gemini", new=AsyncMock(side_effect=RuntimeError("vertex down"))), \
-             patch("stash.categorizer._call_groq", new=AsyncMock(side_effect=RuntimeError("groq down"))), \
+        with patch("stash.categorizer._call_groq", new=AsyncMock(side_effect=RuntimeError("groq down"))), \
              patch("stash.categorizer._call_openrouter", new=AsyncMock(side_effect=RuntimeError("openrouter down"))):
-            with pytest.raises(RuntimeError, match="openrouter down"):
+            with pytest.raises(RuntimeError, match="groq down"):
                 await categorize(pkt, taxonomy)
+
+    @pytest.mark.asyncio
+    async def test_image_uses_vision_chain_not_groq(self, taxonomy):
+        """Images should never reach _call_groq (Groq has no free vision model)."""
+        from stash.categorizer import VISION_MODEL
+
+        pkt = ContentPacket(
+            content_type=ContentType.IMAGE,
+            raw_input="screenshot.png",
+            image_bytes=b"fake",
+            image_mime="image/png",
+        )
+        mock_response = '{"title": "Screenshot", "category": "Tech", "tags": [], "summary": "x", "is_new_category": false, "confidence": 0.7, "reasoning": null}'
+
+        vision_calls = []
+
+        async def mock_openrouter(model, prompt, image_data=None):
+            vision_calls.append((model, image_data))
+            return mock_response
+
+        with patch("stash.categorizer._call_groq", new=AsyncMock(side_effect=AssertionError("must not call groq for images"))), \
+             patch("stash.categorizer._call_openrouter", side_effect=mock_openrouter):
+            result = await categorize(pkt, taxonomy)
+            assert result.title == "Screenshot"
+            assert vision_calls[0][0] == VISION_MODEL
+            assert vision_calls[0][1] == (b"fake", "image/png")
+
+    @pytest.mark.asyncio
+    async def test_image_falls_back_to_vision_fallback_model(self, taxonomy):
+        from stash.categorizer import VISION_FALLBACK_MODEL, VISION_MODEL
+
+        pkt = ContentPacket(
+            content_type=ContentType.IMAGE,
+            raw_input="screenshot.png",
+            image_bytes=b"fake",
+            image_mime="image/png",
+        )
+        mock_response = '{"title": "Screenshot2", "category": "Tech", "tags": [], "summary": "x", "is_new_category": false, "confidence": 0.7, "reasoning": null}'
+
+        calls = []
+
+        async def mock_openrouter(model, prompt, image_data=None):
+            calls.append(model)
+            if model == VISION_MODEL:
+                raise RuntimeError("vision primary down")
+            return mock_response
+
+        with patch("stash.categorizer._call_openrouter", side_effect=mock_openrouter):
+            result = await categorize(pkt, taxonomy)
+            assert result.title == "Screenshot2"
+            assert calls == [VISION_MODEL, VISION_FALLBACK_MODEL]
 
 
 class TestClaudeDetection:
@@ -221,7 +275,7 @@ class TestClaudeDetection:
 
         mock_response = '{"title": "Claude Code Review", "summary": "A review of Claude Code for development."}'
 
-        with patch("stash.categorizer._call_gemini", new=AsyncMock(return_value=mock_response)):
+        with patch("stash.categorizer._call_groq", new=AsyncMock(return_value=mock_response)):
             result = await categorize(pkt, taxonomy)
             assert result.category == "Claude"
             assert result.confidence == 1.0
@@ -305,7 +359,7 @@ class TestCategorizeWithDirective:
 
         mock_response = '{"title": "Productivity Tips", "summary": "Tips for using Claude productively."}'
 
-        with patch("stash.categorizer._call_gemini", new=AsyncMock(return_value=mock_response)):
+        with patch("stash.categorizer._call_groq", new=AsyncMock(return_value=mock_response)):
             result = await categorize(pkt, taxonomy)
 
         assert result.category == "LinkedIn"
@@ -314,7 +368,7 @@ class TestCategorizeWithDirective:
         assert "LinkedIn" in (result.reasoning or "")
 
     @pytest.mark.asyncio
-    async def test_directive_uses_gemini_for_title(self, taxonomy):
+    async def test_directive_uses_model_for_title(self, taxonomy):
         pkt = ContentPacket(
             content_type=ContentType.UNKNOWN_URL,
             raw_input="https://example.com",
@@ -324,7 +378,7 @@ class TestCategorizeWithDirective:
 
         mock_response = '{"title": "Cool Article", "summary": "An overview."}'
 
-        with patch("stash.categorizer._call_gemini", new=AsyncMock(return_value=mock_response)):
+        with patch("stash.categorizer._call_groq", new=AsyncMock(return_value=mock_response)):
             result = await categorize(pkt, taxonomy)
 
         assert result.category == "Tech"
@@ -332,14 +386,15 @@ class TestCategorizeWithDirective:
         assert result.summary == "An overview."
 
     @pytest.mark.asyncio
-    async def test_directive_survives_gemini_failure(self, taxonomy):
+    async def test_directive_survives_model_failure(self, taxonomy):
         pkt = ContentPacket(
             content_type=ContentType.TEXT,
             raw_input="some text",
             user_note="put this in Reels",
         )
 
-        with patch("stash.categorizer._call_gemini", new=AsyncMock(side_effect=RuntimeError("down"))):
+        with patch("stash.categorizer._call_groq", new=AsyncMock(side_effect=RuntimeError("down"))), \
+             patch("stash.categorizer._call_openrouter", new=AsyncMock(side_effect=RuntimeError("down"))):
             result = await categorize(pkt, taxonomy)
 
         assert result.category == "Reels"
@@ -355,6 +410,6 @@ class TestCategorizeWithDirective:
             user_note="great tutorial",
         )
         mock_response = '{"title": "MCP Tutorial", "summary": "How to build an MCP server."}'
-        with patch("stash.categorizer._call_gemini", new=AsyncMock(return_value=mock_response)):
+        with patch("stash.categorizer._call_groq", new=AsyncMock(return_value=mock_response)):
             result = await categorize(pkt, taxonomy)
         assert result.category == "Claude"

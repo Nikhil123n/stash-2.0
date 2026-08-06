@@ -15,25 +15,25 @@ from dataclasses import asdict, dataclass
 logger = logging.getLogger(__name__)
 
 
-MODEL_FLASH = "gemini-2.5-flash"
-MODEL_PRO = "gemini-2.5-pro"
+MODEL_FLASH = "llama-3.3-70b-versatile"  # Groq
+MODEL_PRO = "openai/gpt-oss-20b:free"  # OpenRouter
 
 MODEL_ALIASES: dict[str, str] = {
     "flash": MODEL_FLASH,
     "fast": MODEL_FLASH,
     "default": MODEL_FLASH,
-    "gemini-2.5-flash": MODEL_FLASH,
+    "llama-3.3-70b-versatile": MODEL_FLASH,
     "pro": MODEL_PRO,
     "accurate": MODEL_PRO,
     "smart": MODEL_PRO,
-    "gemini-2.5-pro": MODEL_PRO,
+    "openai/gpt-oss-20b:free": MODEL_PRO,
 }
 
 AVAILABLE_MODELS = [MODEL_FLASH, MODEL_PRO]
 
 MODEL_LABELS: dict[str, str] = {
-    MODEL_FLASH: "Gemini 2.5 Flash (fast, default)",
-    MODEL_PRO: "Gemini 2.5 Pro (slower, more accurate)",
+    MODEL_FLASH: "Flash — Llama 3.3 70B via Groq (fast, default)",
+    MODEL_PRO: "Pro — GPT-OSS 20B via OpenRouter (alternate provider)",
 }
 
 

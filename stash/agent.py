@@ -1,22 +1,24 @@
-"""Gemini function-calling orchestrator.
+"""Tool-calling orchestrator (Groq / OpenRouter, OpenAI-compatible APIs).
 
-Plain-text Discord messages flow through `handle_text()`. The agent asks
-Gemini to pick a tool from the registry; if it picks a safe tool, we run it
-and return a formatted reply. If it picks a destructive tool, we surface a
-`PendingTool` so the bot can ask the user for confirmation. If no tool is
-picked, we fall back to Gemini's conversational text.
+Plain-text Discord messages flow through `handle_text()`. The agent asks the
+configured model to pick a tool from the registry; if it picks a safe tool,
+we run it and return a formatted reply. If it picks a destructive tool, we
+surface a `PendingTool` so the bot can ask the user for confirmation. If no
+tool is picked, we fall back to the model's conversational text. On failure,
+`handle_text()` retries once against `settings.fallback_for(model)`.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from dataclasses import dataclass, field
 from typing import Any
 
 from stash.security import sanitize_for_prompt
-from stash.settings import MODEL_FLASH
+from stash.settings import MODEL_FLASH, MODEL_PRO, fallback_for
 from stash.taxonomy import TaxonomyCache
 from stash.tools import Tool
 
@@ -26,6 +28,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_AGENT_MODEL = MODEL_FLASH
 AGENT_TIMEOUT = 20.0
+
+# Which OpenAI-compatible API a given agent model lives on.
+PROVIDER_FOR_MODEL = {MODEL_FLASH: "groq", MODEL_PRO: "openrouter"}
 
 SYSTEM_PROMPT = (
     "You are Stash, a personal mymind assistant chatting with the owner in "
@@ -64,93 +69,73 @@ class AgentResult:
     error: str | None = None
 
 
-# ── Vertex glue ──────────────────────────────────────────────────────────
+# ── Model glue ───────────────────────────────────────────────────────────
 
 
-_vertexai_initialized = False
-
-
-def _ensure_vertex_init() -> None:
-    global _vertexai_initialized
-    if _vertexai_initialized:
-        return
-    import vertexai
-    vertexai.init(
-        project=os.environ.get("GCP_PROJECT_ID"),
-        location=os.environ.get("GCP_LOCATION", "us-central1"),
+def _build_client(model_name: str):
+    """Groq and OpenRouter both expose an OpenAI-compatible chat completions
+    API, so one client type covers both — only base_url/api_key differ."""
+    provider = PROVIDER_FOR_MODEL.get(model_name, "groq")
+    if provider == "groq":
+        from groq import AsyncGroq
+        return AsyncGroq()
+    from openai import AsyncOpenAI
+    return AsyncOpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=os.environ["OPENROUTER_API_KEY"],
     )
-    _vertexai_initialized = True
 
 
-async def _call_gemini_with_tools(
+async def _call_model_with_tools(
     user_text: str,
     system_prompt: str,
     registry: dict[str, Tool],
     model_name: str = DEFAULT_AGENT_MODEL,
 ) -> dict:
-    """Call Gemini with function-calling enabled.
+    """Call the model with tool-calling enabled.
 
     Returns a normalized dict:
         {"function_call": {"name": str, "args": dict} | None,
          "text": str | None}
     """
-    _ensure_vertex_init()
-    from vertexai.generative_models import (
-        FunctionDeclaration,
-        GenerativeModel,
-        Part,
-        Tool as VertexTool,
-    )
-
-    declarations = [
-        FunctionDeclaration(
-            name=t.name,
-            description=t.description,
-            parameters=t.parameters,
-        )
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.parameters,
+            },
+        }
         for t in registry.values()
     ]
-    vtool = VertexTool(function_declarations=declarations)
 
-    loop = asyncio.get_running_loop()
-
-    def _sync_call() -> dict:
-        model = GenerativeModel(
-            model_name,
-            system_instruction=system_prompt,
-            tools=[vtool],
-        )
-        response = model.generate_content(
-            [Part.from_text(user_text)],
-            generation_config={"temperature": 0.2, "max_output_tokens": 1024},
-        )
-        try:
-            part = response.candidates[0].content.parts[0]
-        except (IndexError, AttributeError):
-            return {"function_call": None, "text": None}
-
-        fc = getattr(part, "function_call", None)
-        if fc and getattr(fc, "name", None):
-            args = {}
-            raw_args = getattr(fc, "args", None)
-            if raw_args is not None:
-                try:
-                    args = dict(raw_args)
-                except Exception:
-                    args = {}
-            return {"function_call": {"name": fc.name, "args": args}, "text": None}
-
-        text = ""
-        try:
-            text = response.text
-        except Exception:
-            text = getattr(part, "text", "") or ""
-        return {"function_call": None, "text": text or None}
-
-    return await asyncio.wait_for(
-        loop.run_in_executor(None, _sync_call),
+    client = _build_client(model_name)
+    response = await asyncio.wait_for(
+        client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text},
+            ],
+            tools=tools,
+            tool_choice="auto",
+            temperature=0.2,
+            max_tokens=1024,
+        ),
         timeout=AGENT_TIMEOUT,
     )
+
+    message = response.choices[0].message
+    if message.tool_calls:
+        call = message.tool_calls[0]
+        try:
+            args = json.loads(call.function.arguments) if call.function.arguments else {}
+        except (json.JSONDecodeError, TypeError):
+            args = {}
+        return {"function_call": {"name": call.function.name, "args": args}, "text": None}
+
+    return {"function_call": None, "text": message.content or None}
 
 
 # ── Result formatting ────────────────────────────────────────────────────
@@ -284,6 +269,23 @@ def _taxonomy_block(taxonomy: TaxonomyCache | None) -> str:
     return f"\n\nKnown spaces: {spaces}\nKnown tags: {tags}"
 
 
+async def _call_with_agent_fallback(
+    prompt: str, registry: dict[str, Tool], model: str
+) -> dict:
+    """Try `model`; on any failure retry once against its fallback
+    (settings.fallback_for). A fallback-call failure propagates uncaught."""
+    try:
+        return await _call_model_with_tools(prompt, SYSTEM_PROMPT, registry, model_name=model)
+    except Exception as e:
+        fallback_model = fallback_for(model)
+        logger.warning(
+            "Agent model %s failed (%s), retrying with %s", model, e, fallback_model
+        )
+        return await _call_model_with_tools(
+            prompt, SYSTEM_PROMPT, registry, model_name=fallback_model
+        )
+
+
 async def handle_text(
     text: str,
     *,
@@ -291,14 +293,13 @@ async def handle_text(
     taxonomy: TaxonomyCache | None = None,
     model: str = DEFAULT_AGENT_MODEL,
 ) -> AgentResult:
-    """Handle a plain-text user message. Picks a tool via Gemini or chats."""
+    """Handle a plain-text user message. Picks a tool or chats. Retries once
+    against the fallback model on timeout/error before giving up."""
     safe = sanitize_for_prompt(text)
     prompt = f"User message: {safe}{_taxonomy_block(taxonomy)}"
 
     try:
-        response = await _call_gemini_with_tools(
-            prompt, SYSTEM_PROMPT, registry, model_name=model
-        )
+        response = await _call_with_agent_fallback(prompt, registry, model)
     except asyncio.TimeoutError:
         return AgentResult(error="Agent timed out.", text="Took too long — try again?")
     except Exception as e:

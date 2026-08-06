@@ -1,4 +1,4 @@
-"""Tests for the agent orchestrator (with Gemini mocked out)."""
+"""Tests for the agent orchestrator (with the model call mocked out)."""
 
 from unittest.mock import AsyncMock, patch
 
@@ -13,6 +13,7 @@ from stash.agent import (
     handle_text,
 )
 from stash.gateway.sandbox import SandboxGateway
+from stash.settings import MODEL_FLASH, MODEL_PRO, fallback_for
 from stash.taxonomy import TaxonomyCache
 from stash.tools import build_registry
 
@@ -30,8 +31,8 @@ async def env(tmp_path):
     return gw, cache, registry
 
 
-def _stub_gemini(function_call=None, text=None):
-    """Build an AsyncMock matching _call_gemini_with_tools' return shape."""
+def _stub_agent_call(function_call=None, text=None):
+    """Build an AsyncMock matching _call_model_with_tools' return shape."""
     return AsyncMock(return_value={"function_call": function_call, "text": text})
 
 
@@ -39,8 +40,8 @@ class TestHandleText:
     @pytest.mark.asyncio
     async def test_list_spaces_dispatch(self, env):
         gw, taxonomy, registry = env
-        stub = _stub_gemini(function_call={"name": "list_spaces", "args": {}})
-        with patch("stash.agent._call_gemini_with_tools", new=stub):
+        stub = _stub_agent_call(function_call={"name": "list_spaces", "args": {}})
+        with patch("stash.agent._call_model_with_tools", new=stub):
             result = await handle_text(
                 "list my spaces", registry=registry, taxonomy=taxonomy
             )
@@ -53,11 +54,11 @@ class TestHandleText:
     async def test_list_cards_in_space_dispatch(self, env):
         gw, taxonomy, registry = env
         await gw.save_url("https://example.com", "Reel about Claude", [], "Claude", "n")
-        stub = _stub_gemini(function_call={
+        stub = _stub_agent_call(function_call={
             "name": "list_cards_in_space",
             "args": {"space_name": "Claude"},
         })
-        with patch("stash.agent._call_gemini_with_tools", new=stub):
+        with patch("stash.agent._call_model_with_tools", new=stub):
             result = await handle_text(
                 "what's in claude?", registry=registry, taxonomy=taxonomy
             )
@@ -68,10 +69,10 @@ class TestHandleText:
     @pytest.mark.asyncio
     async def test_create_space_dispatch(self, env):
         gw, taxonomy, registry = env
-        stub = _stub_gemini(function_call={
+        stub = _stub_agent_call(function_call={
             "name": "create_space", "args": {"name": "LinkedIn"},
         })
-        with patch("stash.agent._call_gemini_with_tools", new=stub):
+        with patch("stash.agent._call_model_with_tools", new=stub):
             result = await handle_text(
                 "make a LinkedIn space", registry=registry, taxonomy=taxonomy
             )
@@ -83,10 +84,10 @@ class TestHandleText:
     async def test_destructive_returns_pending_without_executing(self, env):
         gw, taxonomy, registry = env
         card = await gw.save_note("doomed", "Doomed", [], "")
-        stub = _stub_gemini(function_call={
+        stub = _stub_agent_call(function_call={
             "name": "delete_card", "args": {"card_id": card.mymind_id},
         })
-        with patch("stash.agent._call_gemini_with_tools", new=stub):
+        with patch("stash.agent._call_model_with_tools", new=stub):
             result = await handle_text(
                 f"delete card {card.mymind_id}",
                 registry=registry, taxonomy=taxonomy,
@@ -100,8 +101,8 @@ class TestHandleText:
     @pytest.mark.asyncio
     async def test_conversational_fallback(self, env):
         _, taxonomy, registry = env
-        stub = _stub_gemini(function_call=None, text="Hey there!")
-        with patch("stash.agent._call_gemini_with_tools", new=stub):
+        stub = _stub_agent_call(function_call=None, text="Hey there!")
+        with patch("stash.agent._call_model_with_tools", new=stub):
             result = await handle_text("hi", registry=registry, taxonomy=taxonomy)
         assert result.tool_name is None
         assert result.text == "Hey there!"
@@ -109,8 +110,8 @@ class TestHandleText:
     @pytest.mark.asyncio
     async def test_unknown_tool_returns_error_reply(self, env):
         _, taxonomy, registry = env
-        stub = _stub_gemini(function_call={"name": "no_such_tool", "args": {}})
-        with patch("stash.agent._call_gemini_with_tools", new=stub):
+        stub = _stub_agent_call(function_call={"name": "no_such_tool", "args": {}})
+        with patch("stash.agent._call_model_with_tools", new=stub):
             result = await handle_text("x", registry=registry, taxonomy=taxonomy)
         assert result.error is not None
         assert result.text is not None
@@ -118,25 +119,26 @@ class TestHandleText:
     @pytest.mark.asyncio
     async def test_bad_args_returns_error_reply(self, env):
         _, taxonomy, registry = env
-        stub = _stub_gemini(function_call={
+        stub = _stub_agent_call(function_call={
             "name": "list_cards_in_space", "args": {"wrong_kwarg": "x"},
         })
-        with patch("stash.agent._call_gemini_with_tools", new=stub):
+        with patch("stash.agent._call_model_with_tools", new=stub):
             result = await handle_text("x", registry=registry, taxonomy=taxonomy)
         assert result.error is not None
 
     @pytest.mark.asyncio
-    async def test_gemini_exception_handled(self, env):
+    async def test_model_exception_handled_after_fallback_also_fails(self, env):
         _, taxonomy, registry = env
         stub = AsyncMock(side_effect=RuntimeError("boom"))
-        with patch("stash.agent._call_gemini_with_tools", new=stub):
+        with patch("stash.agent._call_model_with_tools", new=stub):
             result = await handle_text("hi", registry=registry, taxonomy=taxonomy)
         assert result.error == "boom"
         assert result.text is not None
+        assert stub.call_count == 2  # primary attempt + fallback retry
 
     @pytest.mark.asyncio
     async def test_model_param_is_forwarded(self, env):
-        """The `model` kwarg should be passed through to the Gemini call."""
+        """The `model` kwarg should be passed through to the model call."""
         _, taxonomy, registry = env
         captured = {}
 
@@ -144,12 +146,31 @@ class TestHandleText:
             captured["model"] = model_name
             return {"function_call": None, "text": "ok"}
 
-        with patch("stash.agent._call_gemini_with_tools", new=fake):
+        with patch("stash.agent._call_model_with_tools", new=fake):
             await handle_text(
                 "hi", registry=registry, taxonomy=taxonomy,
-                model="gemini-2.5-pro",
+                model=MODEL_PRO,
             )
-        assert captured["model"] == "gemini-2.5-pro"
+        assert captured["model"] == MODEL_PRO
+
+    @pytest.mark.asyncio
+    async def test_fallback_retry_on_primary_failure(self, env):
+        """A failing primary model retries once via settings.fallback_for."""
+        _, taxonomy, registry = env
+        calls = []
+
+        async def fake(user_text, system_prompt, registry_arg, model_name=None):
+            calls.append(model_name)
+            if model_name == MODEL_FLASH:
+                raise RuntimeError("primary down")
+            return {"function_call": None, "text": "recovered"}
+
+        with patch("stash.agent._call_model_with_tools", new=fake):
+            result = await handle_text(
+                "hi", registry=registry, taxonomy=taxonomy, model=MODEL_FLASH
+            )
+        assert result.text == "recovered"
+        assert calls == [MODEL_FLASH, fallback_for(MODEL_FLASH)]
 
 
 class TestExecutePending:

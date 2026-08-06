@@ -14,8 +14,8 @@ def _make_config(tmp_path) -> StashConfig:
         DISCORD_TOKEN="x",
         STASH_OWNER_ID=1,
         STASH_ENV="sandbox",
-        GOOGLE_APPLICATION_CREDENTIALS=str(tmp_path / "fake-key.json"),
         GROQ_API_KEY="x",
+        OPENROUTER_API_KEY="x",
         SANDBOX_FILE=str(tmp_path / "sb.json"),
         TMP_DIR=str(tmp_path / "tmp"),
     )

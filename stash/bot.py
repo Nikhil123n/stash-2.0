@@ -35,7 +35,7 @@ logger = logging.getLogger("stash")
 CONFIDENCE_THRESHOLD = 0.75
 CONFIRMATION_TIMEOUT = 300  # 5 minutes
 GATEWAY_MODE = "cookie-local"  # JWT-key auth lives only on the archived approach/jwt branch
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 SETTINGS_FILE = "stash_settings.json"
 
 
@@ -72,7 +72,6 @@ class StashBot(discord.Client):
 
         logger.info("[1/4] Preparing temp directory...")
         self._wipe_tmp()
-        self._restore_gcp_credentials()
         logger.info("  OK")
 
         logger.info("[2/4] Connecting to mymind (%s)...", GATEWAY_MODE)
@@ -104,11 +103,6 @@ class StashBot(discord.Client):
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
         os.makedirs(tmp_dir, exist_ok=True)
-
-    def _restore_gcp_credentials(self) -> None:
-        """Re-write GCP credentials file if using base64 env var (wiped by _wipe_tmp)."""
-        from stash.config import _setup_gcp_credentials
-        _setup_gcp_credentials()
 
     async def on_ready(self) -> None:
         logger.info("Bot online as %s (pid=%d)", self.user, os.getpid())
@@ -219,7 +213,7 @@ class StashBot(discord.Client):
         if not prompt.strip():
             return
 
-        # Prefix commands (/help, /model, /stats) bypass Gemini entirely.
+        # Prefix commands (/help, /model, /stats) bypass the agent entirely.
         cmd_result = await try_command(
             prompt, settings=self._settings, registry=self._tool_registry
         )

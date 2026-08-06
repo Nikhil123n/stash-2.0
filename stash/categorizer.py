@@ -12,13 +12,18 @@ from stash.taxonomy import TaxonomyCache
 
 logger = logging.getLogger(__name__)
 
-PRIMARY_MODEL = "gemini-2.5-flash"
-# Fallback chain crosses providers so one outage can't take down every rung:
-# Vertex AI -> Groq -> OpenRouter. Both fallback models are free-tier and
-# picked for strong instruction-following/JSON output.
-FALLBACK_MODEL = "llama-3.3-70b-versatile"  # Groq
-FALLBACK_MODEL_2 = "qwen/qwen-2.5-72b-instruct:free"  # OpenRouter
+# All free-tier, cross-provider so one outage can't take down every rung.
+# Groq has no vision-capable free model, so image categorization uses a
+# separate, OpenRouter-only chain below.
+PRIMARY_MODEL = "llama-3.3-70b-versatile"  # Groq
+FALLBACK_MODEL = "openai/gpt-oss-20b:free"  # OpenRouter
+FALLBACK_MODEL_2 = "openai/gpt-oss-120b"  # Groq
 MODEL_CHAIN = [PRIMARY_MODEL, FALLBACK_MODEL, FALLBACK_MODEL_2]
+
+VISION_MODEL = "google/gemma-4-26b-a4b-it:free"  # OpenRouter
+VISION_FALLBACK_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"  # OpenRouter
+VISION_MODEL_CHAIN = [VISION_MODEL, VISION_FALLBACK_MODEL]
+
 LATENCY_THRESHOLD = 30.0
 
 SYSTEM_PROMPT = (
@@ -160,13 +165,119 @@ def _is_claude_content(packet: ContentPacket) -> bool:
     return any(keyword in text for keyword in CLAUDE_KEYWORDS)
 
 
+async def _call_groq(
+    model_name: str,
+    user_prompt: str,
+    image_data: tuple[bytes, str] | None = None,
+) -> str:
+    """Groq's free-tier catalog currently has no vision model, so image_data
+    is accepted only for _run_chain signature uniformity and should never
+    actually be passed a value here."""
+    from groq import AsyncGroq
+
+    client = AsyncGroq()
+    response = await client.chat.completions.create(
+        model=model_name,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.3,
+        max_tokens=2048,
+        response_format={"type": "json_object"},
+    )
+    return response.choices[0].message.content
+
+
+async def _call_openrouter(
+    model_name: str,
+    user_prompt: str,
+    image_data: tuple[bytes, str] | None = None,
+) -> str:
+    """OpenRouter's OpenAI-compatible API. Supports optional image input for
+    the vision chain's free vision-capable models."""
+    import base64
+    import os
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=os.environ["OPENROUTER_API_KEY"],
+    )
+
+    if image_data:
+        img_bytes, mime = image_data
+        b64 = base64.b64encode(img_bytes).decode()
+        user_content = [
+            {"type": "text", "text": user_prompt},
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+        ]
+    else:
+        user_content = user_prompt
+
+    response = await client.chat.completions.create(
+        model=model_name,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        temperature=0.3,
+        max_tokens=2048,
+        response_format={"type": "json_object"},
+    )
+    return response.choices[0].message.content
+
+
+async def _run_chain(
+    calls: list[tuple],
+    user_prompt: str,
+    image_data: tuple[bytes, str] | None = None,
+) -> str:
+    """Try each (call_fn, model_name) pair in order, falling through to the
+    next on any failure or timeout. Raises the last error if every tier
+    fails."""
+    err: Exception | None = None
+    for i, (call_fn, model_name) in enumerate(calls):
+        try:
+            return await asyncio.wait_for(
+                call_fn(model_name, user_prompt, image_data),
+                timeout=LATENCY_THRESHOLD,
+            )
+        except Exception as e:
+            err = e
+            if i + 1 < len(calls):
+                logger.warning(
+                    "%s failed (%s), falling back to %s",
+                    model_name, e, calls[i + 1][1],
+                )
+    logger.error("All models in chain failed: %s", err)
+    raise err
+
+
+def _text_chain() -> list[tuple]:
+    # Built fresh per call (not a module-level constant) so tests can patch
+    # _call_groq/_call_openrouter by name and have it take effect here.
+    return [
+        (_call_groq, PRIMARY_MODEL),
+        (_call_openrouter, FALLBACK_MODEL),
+        (_call_groq, FALLBACK_MODEL_2),
+    ]
+
+
+def _vision_chain() -> list[tuple]:
+    return [
+        (_call_openrouter, VISION_MODEL),
+        (_call_openrouter, VISION_FALLBACK_MODEL),
+    ]
+
+
 async def categorize(packet: ContentPacket, taxonomy: TaxonomyCache) -> CategoryResult:
     await taxonomy.refresh_if_stale()
 
     # Precedence:
     # 1. Explicit user directive in the same message ("put this in X") wins.
     # 2. Else Claude keyword path -> dedicated "Claude" space.
-    # 3. Else general Gemini inference against the existing taxonomy.
+    # 3. Else general model inference against the existing taxonomy.
     directive_space = parse_space_directive(packet.user_note)
 
     if directive_space:
@@ -176,28 +287,12 @@ async def categorize(packet: ContentPacket, taxonomy: TaxonomyCache) -> Category
         return await _categorize_claude(packet, taxonomy)
 
     user_prompt = _build_user_prompt(packet, taxonomy)
-    image_data = None
+
     if packet.image_bytes and packet.image_mime:
         image_data = (packet.image_bytes, packet.image_mime)
-
-    try:
-        result_json = await asyncio.wait_for(
-            _call_gemini(PRIMARY_MODEL, user_prompt, image_data),
-            timeout=LATENCY_THRESHOLD,
-        )
-    except (asyncio.TimeoutError, Exception) as e:
-        logger.warning("Primary model failed (%s), falling back to %s", e, FALLBACK_MODEL)
-        try:
-            result_json = await _call_groq(FALLBACK_MODEL, user_prompt)
-        except Exception as groq_err:
-            logger.warning(
-                "Groq fallback failed (%s), falling back to %s", groq_err, FALLBACK_MODEL_2
-            )
-            try:
-                result_json = await _call_openrouter(FALLBACK_MODEL_2, user_prompt)
-            except Exception as openrouter_err:
-                logger.error("All fallback models failed: %s", openrouter_err)
-                raise
+        result_json = await _run_chain(_vision_chain(), user_prompt, image_data)
+    else:
+        result_json = await _run_chain(_text_chain(), user_prompt)
 
     result = _parse_result(result_json)
     result.verbatim_note = packet.user_note
@@ -208,8 +303,8 @@ async def _categorize_with_forced_space(
     packet: ContentPacket, forced_space: str
 ) -> CategoryResult:
     """User explicitly named a target space. Force category and still let
-    Gemini generate a good title/summary/tags. The save layer is responsible
-    for creating the space if it doesn't exist."""
+    the model generate a good title/summary/tags. The save layer is
+    responsible for creating the space if it doesn't exist."""
     transcript_block = ""
     if packet.transcript:
         transcript_block = f"Transcript: {sanitize_for_prompt(packet.transcript)[:500]}\n"
@@ -226,10 +321,7 @@ async def _categorize_with_forced_space(
     title = packet.user_note[:60] if packet.user_note else (packet.raw_input[:60] or "Untitled")
     summary = packet.user_note or (packet.raw_input[:120] if packet.raw_input else "")
     try:
-        result_json = await asyncio.wait_for(
-            _call_gemini(PRIMARY_MODEL, prompt, None),
-            timeout=LATENCY_THRESHOLD,
-        )
+        result_json = await _run_chain(_text_chain(), prompt)
         data = json.loads(result_json.strip())
         title = data.get("title", title) or title
         summary = data.get("summary", summary) or summary
@@ -266,10 +358,7 @@ async def _categorize_claude(packet: ContentPacket, taxonomy: TaxonomyCache) -> 
     )
 
     try:
-        result_json = await asyncio.wait_for(
-            _call_gemini(PRIMARY_MODEL, prompt, None),
-            timeout=LATENCY_THRESHOLD,
-        )
+        result_json = await _run_chain(_text_chain(), prompt)
         data = json.loads(result_json.strip())
         title = data.get("title", "Claude Content")
         summary = data.get("summary", "")
@@ -321,94 +410,6 @@ def _build_user_prompt(packet: ContentPacket, taxonomy: TaxonomyCache) -> str:
         user_note_block=user_note_block,
         image_block=image_block,
     )
-
-
-_vertexai_initialized = False
-
-
-async def _call_gemini(
-    model_name: str,
-    user_prompt: str,
-    image_data: tuple[bytes, str] | None = None,
-) -> str:
-    import vertexai
-    from vertexai.generative_models import GenerativeModel, Part
-
-    global _vertexai_initialized
-    if not _vertexai_initialized:
-        import os
-        vertexai.init(
-            project=os.environ.get("GCP_PROJECT_ID"),
-            location=os.environ.get("GCP_LOCATION", "us-central1"),
-        )
-        _vertexai_initialized = True
-
-    loop = asyncio.get_running_loop()
-
-    def _sync_call() -> str:
-        model = GenerativeModel(
-            model_name,
-            system_instruction=SYSTEM_PROMPT,
-        )
-
-        contents = []
-        if image_data:
-            img_bytes, mime = image_data
-            contents.append(Part.from_data(data=img_bytes, mime_type=mime))
-        contents.append(Part.from_text(user_prompt))
-
-        response = model.generate_content(
-            contents,
-            generation_config={
-                "temperature": 0.3,
-                "max_output_tokens": 2048,
-                "response_mime_type": "application/json",
-            },
-        )
-        return response.text
-
-    return await loop.run_in_executor(None, _sync_call)
-
-
-async def _call_groq(model_name: str, user_prompt: str) -> str:
-    """Text-only fallback path. Images are dropped here since none of
-    Groq's free-tier models support vision input."""
-    from groq import AsyncGroq
-
-    client = AsyncGroq()
-    response = await client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.3,
-        max_tokens=2048,
-        response_format={"type": "json_object"},
-    )
-    return response.choices[0].message.content
-
-
-async def _call_openrouter(model_name: str, user_prompt: str) -> str:
-    """Text-only second fallback path, via OpenRouter's OpenAI-compatible API."""
-    import os
-    from openai import AsyncOpenAI
-
-    client = AsyncOpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=os.environ["OPENROUTER_API_KEY"],
-    )
-    response = await client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.3,
-        max_tokens=2048,
-        response_format={"type": "json_object"},
-    )
-    return response.choices[0].message.content
 
 
 def _parse_result(raw_json: str) -> CategoryResult:

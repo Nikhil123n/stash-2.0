@@ -44,8 +44,8 @@ in backticks — copy it straight into a move / delete command.
 **Bot commands**
 - `/help` — this guide
 - `/model` — show current AI model
-- `/model flash` — switch to Gemini 2.5 Flash (fast, default)
-- `/model pro` — switch to Gemini 2.5 Pro (slower, more accurate)
+- `/model flash` — switch to Flash: Llama 3.3 70B via Groq (fast, default)
+- `/model pro` — switch to Pro: GPT-OSS 20B via OpenRouter (alternate provider)
 - `/stats` — library overview
 
 **Privacy**

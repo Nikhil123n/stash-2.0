@@ -8,21 +8,22 @@ categorization, and agentic library-management workflows.
 
 It still captures content (links, screenshots, voice notes,
 YouTube/reel URLs) and saves categorized cards in [mymind](https://mymind.com).
-As of v2.2.0, plain-text Discord messages can also manage the library through
-a Gemini function-calling agent.
+As of v2.3.0, plain-text Discord messages can also manage the library through
+a Groq/OpenRouter function-calling agent — Stash runs entirely on free-tier
+LLM providers, no Gemini/Vertex AI dependency.
 
 ## How it works
 
 1. Drop content into a Discord DM or channel
 2. Bot extracts meaning (transcribes audio, reads images, parses URLs)
-3. Gemini categorizes against your existing mymind taxonomy
+3. The categorizer classifies against your existing mymind taxonomy
 4. Card is saved to mymind with title, category, tags, and summary
 
 Plain-text messages with no URL or attachment now take a second path:
 
 1. Prefix commands such as `/help`, `/model`, and `/stats` are handled locally
-2. Other text goes to the Gemini agent
-3. Gemini selects a gateway-backed tool when live mymind data or mutation is needed
+2. Other text goes to the agent
+3. The agent selects a gateway-backed tool when live mymind data or mutation is needed
 4. Destructive tools (`move_card_to_space`, `delete_card`) require confirmation
 
 Examples:
@@ -52,9 +53,8 @@ cp .env.example .env
 |----------|--------|
 | `DISCORD_TOKEN` | [Discord Developer Portal](https://discord.com/developers/applications) |
 | `STASH_OWNER_ID` | Your Discord user ID (enable Developer Mode, right-click yourself) |
-| `GOOGLE_APPLICATION_CREDENTIALS` | GCP service account JSON with Vertex AI access |
-| `GROQ_API_KEY` | [Groq Console](https://console.groq.com) — categorizer fallback tier 2 |
-| `OPENROUTER_API_KEY` | [OpenRouter dashboard](https://openrouter.ai/keys) — categorizer fallback tier 3 |
+| `GROQ_API_KEY` | [Groq Console](https://console.groq.com) — primary provider for agent + categorizer |
+| `OPENROUTER_API_KEY` | [OpenRouter dashboard](https://openrouter.ai/keys) — fallback provider + all image/vision categorization |
 
 ### mymind auth — two schemes, only one active
 
@@ -83,9 +83,6 @@ read the cookie-based set below.
 | Variable | Purpose |
 |----------|---------|
 | `FFMPEG_LOCATION` | Path to ffmpeg/ffprobe binaries if not on PATH (e.g., `/usr/bin` or `C:\ffmpeg\bin`) |
-| `GCP_PROJECT_ID` | Vertex AI project ID used by `vertexai.init` |
-| `GCP_LOCATION` | Vertex AI region, default `us-central1` |
-| `GCP_CREDENTIALS_JSON` | Base64 service-account JSON; decoded to `/tmp/stash/gcp-key.json` at startup |
 | `SANDBOX_FILE` | Sandbox JSON path, default `./sandbox_data.json` |
 | `TMP_DIR` | Temp media/settings directory, default `/tmp/stash` |
 
@@ -177,20 +174,22 @@ Discord message -> InputRouter -> Extractor -> Categorizer -> Gateway -> mymind
 
 - **InputRouter**: Classifies messages by content type
 - **Extractors**: video (yt-dlp + Whisper), audio (Whisper), image (passthrough)
-- **Categorizer**: Gemini 2.5 Flash, falling back to Groq Llama 3.3 70B then
-  OpenRouter Qwen 2.5 72B (free tier) so no single provider outage breaks
-  categorization; taxonomy-aware prompting
+- **Categorizer**: two free-tier chains, cross-provider. Text: Groq Llama
+  3.3 70B -> OpenRouter GPT-OSS 20B -> Groq GPT-OSS 120B. Images: OpenRouter
+  Gemma 4 26B -> OpenRouter Nemotron Nano Omni (Groq has no free vision
+  model); taxonomy-aware prompting
 - **Gateway**: mymind API wrapper (production) or local JSON (sandbox)
-- **Agent**: Gemini function-calling layer for text-only library-management messages
+- **Agent**: Groq/OpenRouter function-calling layer for text-only
+  library-management messages, with automatic fallback on failure
 - **Tools**: Gateway-backed actions for list/search/create/save/move/delete/stats/recent/random
 
 ## Current Discord Commands
 
 - `/help` - show the in-Discord guide
 - `/model` - show current agent model
-- `/model flash` - use Gemini 2.5 Flash for the agent
-- `/model pro` - use Gemini 2.5 Pro for the agent
-- `/stats` - show library stats without a Gemini round trip
+- `/model flash` - use Llama 3.3 70B via Groq for the agent (default)
+- `/model pro` - use GPT-OSS 20B via OpenRouter for the agent
+- `/stats` - show library stats without a model round trip
 
 Every save reply and card-listing response now includes the mymind card ID
 where available, so follow-up move/delete commands can reference it directly.
@@ -208,16 +207,19 @@ in: Career Development <url>
 ```
 
 Directive precedence is: explicit directive, Claude/Anthropic keyword fast
-path, then general Gemini inference.
+path, then general model inference.
 
 ## Operational Gotchas
 
 - Plain text now routes to the agent path. A plain note is saved only when
   the agent selects the `save_note` tool.
-- The agent UI reports a fallback model, but `stash.agent.handle_text` does
-  not currently retry with that fallback after timeout or exception.
-- The categorizer path implements a 3-tier cross-provider fallback:
-  Gemini 2.5 Flash -> Groq Llama 3.3 70B -> OpenRouter Qwen 2.5 72B.
+- The agent retries once against `settings.fallback_for(model)` on
+  timeout/error before giving up (`stash.agent._call_with_agent_fallback`).
+- The categorizer runs two independent 2-3 tier cross-provider fallback
+  chains — text and vision — see `stash.categorizer.MODEL_CHAIN` /
+  `VISION_MODEL_CHAIN`. Free-tier model catalogs change frequently; if a
+  model id 404s, check the provider's live `/models` endpoint before
+  assuming the code is wrong.
 - The production gateway uses unofficial mymind internals and cookie auth.
 - `mymind-api` is installed from upstream `main`, so rebuilds can change
   behavior without a Stash commit.
