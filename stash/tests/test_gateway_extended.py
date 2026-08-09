@@ -80,6 +80,22 @@ class TestSandboxAgentMethods:
         out = await sandbox.search_cards(query="ToDelete")
         assert out == []
 
+    @pytest.mark.asyncio
+    async def test_assign_to_space_moves_not_duplicates(self, sandbox):
+        """A card assigned to a second space must leave the first — mymind
+        allows multi-space membership, Stash enforces single-space."""
+        card = await sandbox.save_note("x", "Movable", [], "Claude")
+        spaces = await sandbox.get_spaces()
+        claude_id = next(s["id"] for s in spaces if s["name"] == "Claude")
+        tech_id, _ = await sandbox.resolve_space("Tech")
+
+        await sandbox.assign_to_space(card.mymind_id, tech_id)
+
+        claude_cards = await sandbox.get_space_cards(claude_id)
+        tech_cards = await sandbox.get_space_cards(tech_id)
+        assert claude_cards == []
+        assert [c["id"] for c in tech_cards] == [card.mymind_id]
+
 
 class TestMyMindGatewayAgentMethods:
     def _make(self):
@@ -123,6 +139,28 @@ class TestMyMindGatewayAgentMethods:
         mock._request.side_effect = RuntimeError("nope")
         ok = await gw.assign_to_space("card1", "sp1")
         assert ok is False
+
+    @pytest.mark.asyncio
+    async def test_assign_to_space_removes_from_other_spaces(self):
+        """mymind allows a card in multiple spaces; Stash must not."""
+        gw, mock = self._make()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock._request.return_value = mock_resp
+        mock._headers_json.return_value = {}
+        mock.get_object.return_value = {
+            "spaces": [{"id": "sp_old_1"}, {"id": "sp1"}, {"id": "sp_old_2"}],
+        }
+        ok = await gw.assign_to_space("card1", "sp1")
+        assert ok is True
+
+        methods_and_urls = [
+            (call.args[0], call.args[1]) for call in mock._request.call_args_list
+        ]
+        assert ("PUT", "/spaces/sp1/objects/card1") in methods_and_urls
+        assert ("DELETE", "/spaces/sp_old_1/objects/card1") in methods_and_urls
+        assert ("DELETE", "/spaces/sp_old_2/objects/card1") in methods_and_urls
+        assert ("DELETE", "/spaces/sp1/objects/card1") not in methods_and_urls
 
     @pytest.mark.asyncio
     async def test_save_url_sets_assignment_flag(self):

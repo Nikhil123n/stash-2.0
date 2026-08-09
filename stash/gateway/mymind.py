@@ -163,7 +163,9 @@ class MyMindGateway:
         return await self._resolve_space_id(name, create_if_missing=True)
 
     async def assign_to_space(self, card_id: str, space_id: str) -> bool:
-        """Assign a card to a space via PUT /spaces/{space_id}/objects/{card_id}.
+        """Assign a card to exactly one space via PUT /spaces/{space_id}/objects/{card_id},
+        then remove it from any other space it currently belongs to — mymind
+        allows multi-space membership, Stash enforces single-space.
 
         Returns True on success, False on any non-fatal failure.
         """
@@ -175,11 +177,42 @@ class MyMindGateway:
                 self._client._request, "PUT", f"/spaces/{space_id}/objects/{card_id}",
                 headers=self._client._headers_json(),
             )
-            return True
         except AuthError:
             raise
         except Exception as e:
             logger.warning("assign_to_space failed: %s", e)
+            return False
+
+        await self._remove_from_other_spaces(card_id, keep_space_id=space_id)
+        return True
+
+    async def _remove_from_other_spaces(self, card_id: str, keep_space_id: str) -> None:
+        try:
+            obj = await self._run_sync(self._client.get_object, card_id)
+            current_spaces = obj.get("spaces") if isinstance(obj, dict) else None
+        except AuthError:
+            raise
+        except Exception as e:
+            logger.warning("Could not fetch spaces for %s to enforce single-space: %s", card_id, e)
+            return
+
+        for s in current_spaces or []:
+            space_id = s.get("id") if isinstance(s, dict) else s
+            if space_id and space_id != keep_space_id:
+                await self._unassign_from_space(card_id, space_id)
+
+    async def _unassign_from_space(self, card_id: str, space_id: str) -> bool:
+        """Remove a card from a space via DELETE /spaces/{space_id}/objects/{card_id}."""
+        try:
+            await self._run_sync(
+                self._client._request, "DELETE", f"/spaces/{space_id}/objects/{card_id}",
+                headers=self._client._headers_json(),
+            )
+            return True
+        except AuthError:
+            raise
+        except Exception as e:
+            logger.warning("unassign_from_space failed: %s", e)
             return False
 
     async def post_verbatim_note(self, card_id: str, note_text: str) -> bool:

@@ -164,9 +164,15 @@ class SandboxGateway:
         return space["id"], True
 
     async def assign_to_space(self, card_id: str, space_id: str) -> bool:
+        """Assign a card to exactly one space — mymind allows multi-space
+        membership, Stash enforces single-space by removing the card from
+        every other space first."""
         if not card_id or not space_id:
             return False
         space_objects = self._data.setdefault("space_objects", {})
+        for sid, members in space_objects.items():
+            if sid != space_id and card_id in members:
+                members.remove(card_id)
         members = space_objects.setdefault(space_id, [])
         if card_id not in members:
             members.append(card_id)
