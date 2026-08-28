@@ -30,7 +30,7 @@ DEFAULT_AGENT_MODEL = MODEL_FLASH
 AGENT_TIMEOUT = 20.0
 
 # Which OpenAI-compatible API a given agent model lives on.
-PROVIDER_FOR_MODEL = {MODEL_FLASH: "groq", MODEL_PRO: "openrouter"}
+PROVIDER_FOR_MODEL = {MODEL_FLASH: "groq", MODEL_PRO: "groq"}
 
 SYSTEM_PROMPT = (
     "You are Stash, a personal mymind assistant chatting with the owner in "

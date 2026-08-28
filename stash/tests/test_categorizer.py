@@ -131,30 +131,29 @@ class TestCategorize:
             assert result.confidence == 0.85
 
     @pytest.mark.asyncio
-    async def test_fallback_to_openrouter_on_groq_failure(self, taxonomy):
-        from stash.categorizer import FALLBACK_MODEL
+    async def test_fallback_on_primary_failure(self, taxonomy):
+        from stash.categorizer import FALLBACK_MODEL, PRIMARY_MODEL
 
         pkt = ContentPacket(content_type=ContentType.TEXT, raw_input="test")
         mock_response = '{"title": "Fallback", "category": "Inbox", "tags": [], "summary": "x", "is_new_category": false, "confidence": 0.6, "reasoning": null}'
 
-        openrouter_calls = []
+        groq_calls = []
 
         async def mock_groq(model, prompt, image_data=None):
-            raise asyncio.TimeoutError()
-
-        async def mock_openrouter(model, prompt, image_data=None):
-            openrouter_calls.append(model)
+            groq_calls.append(model)
+            if model == PRIMARY_MODEL:
+                raise asyncio.TimeoutError()
             return mock_response
 
         with patch("stash.categorizer._call_groq", side_effect=mock_groq), \
-             patch("stash.categorizer._call_openrouter", side_effect=mock_openrouter):
+             patch("stash.categorizer._call_openrouter", new=AsyncMock(side_effect=RuntimeError("not used"))):
             result = await categorize(pkt, taxonomy)
             assert result.title == "Fallback"
-            assert openrouter_calls == [FALLBACK_MODEL]
+            assert groq_calls == [PRIMARY_MODEL, FALLBACK_MODEL]
 
     @pytest.mark.asyncio
-    async def test_second_groq_fallback_when_openrouter_also_fails(self, taxonomy):
-        from stash.categorizer import FALLBACK_MODEL_2, PRIMARY_MODEL
+    async def test_third_fallback_when_first_two_fail(self, taxonomy):
+        from stash.categorizer import FALLBACK_MODEL_2, FALLBACK_MODEL, PRIMARY_MODEL
 
         pkt = ContentPacket(content_type=ContentType.TEXT, raw_input="test")
         mock_response = '{"title": "SecondFallback", "category": "Inbox", "tags": [], "summary": "x", "is_new_category": false, "confidence": 0.5, "reasoning": null}'
@@ -163,15 +162,15 @@ class TestCategorize:
 
         async def mock_groq(model, prompt, image_data=None):
             groq_calls.append(model)
-            if model == PRIMARY_MODEL:
-                raise RuntimeError("groq primary down")
+            if model in (PRIMARY_MODEL, FALLBACK_MODEL):
+                raise RuntimeError("groq tier down")
             return mock_response
 
         with patch("stash.categorizer._call_groq", side_effect=mock_groq), \
-             patch("stash.categorizer._call_openrouter", new=AsyncMock(side_effect=RuntimeError("openrouter down"))):
+             patch("stash.categorizer._call_openrouter", new=AsyncMock(side_effect=RuntimeError("not used"))):
             result = await categorize(pkt, taxonomy)
             assert result.title == "SecondFallback"
-            assert groq_calls == [PRIMARY_MODEL, FALLBACK_MODEL_2]
+            assert groq_calls == [PRIMARY_MODEL, FALLBACK_MODEL, FALLBACK_MODEL_2]
 
     @pytest.mark.asyncio
     async def test_all_fallbacks_fail_raises(self, taxonomy):

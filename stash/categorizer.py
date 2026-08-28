@@ -15,9 +15,9 @@ logger = logging.getLogger(__name__)
 # All free-tier, cross-provider so one outage can't take down every rung.
 # Groq has no vision-capable free model, so image categorization uses a
 # separate, OpenRouter-only chain below.
-PRIMARY_MODEL = "llama-3.3-70b-versatile"  # Groq
-FALLBACK_MODEL = "openai/gpt-oss-20b:free"  # OpenRouter
-FALLBACK_MODEL_2 = "openai/gpt-oss-120b"  # Groq
+PRIMARY_MODEL = "openai/gpt-oss-20b"  # Groq free tier (fast)
+FALLBACK_MODEL = "openai/gpt-oss-120b"  # Groq free tier (larger)
+FALLBACK_MODEL_2 = "qwen/qwen3.8-27b"  # Groq free tier (alt architecture)
 MODEL_CHAIN = [PRIMARY_MODEL, FALLBACK_MODEL, FALLBACK_MODEL_2]
 
 VISION_MODEL = "google/gemma-4-26b-a4b-it:free"  # OpenRouter
@@ -259,7 +259,7 @@ def _text_chain() -> list[tuple]:
     # _call_groq/_call_openrouter by name and have it take effect here.
     return [
         (_call_groq, PRIMARY_MODEL),
-        (_call_openrouter, FALLBACK_MODEL),
+        (_call_groq, FALLBACK_MODEL),
         (_call_groq, FALLBACK_MODEL_2),
     ]
 
